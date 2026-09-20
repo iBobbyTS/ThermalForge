@@ -49,10 +49,6 @@ public final class TFLogger {
         write("PROFILE", message)
     }
 
-    public func calibration(_ message: String) {
-        write("CALIBRATION", message)
-    }
-
     public func safety(_ message: String) {
         write("SAFETY", message)
     }

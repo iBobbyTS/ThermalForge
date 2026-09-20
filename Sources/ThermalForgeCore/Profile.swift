@@ -200,38 +200,26 @@ extension FanProfile {
                      sustainedTriggerSec: 4)
     )
 
-    /// Max: attack dog. Instant 100% after 5-second sustained trigger at 65°C.
-    /// They spike, we spike. Ramp-down governor lets temps stabilize before backing off.
+    /// Max: fans pinned at 100%, no temperature conditions. Selecting it means
+    /// permanent max until another profile (or Default) takes over.
     public static let max = FanProfile(
         id: "max",
         name: "Max",
         curve: Curve(stopTemp: 50, startTemp: 65, ceilingTemp: 65,
-                     maxRPMPercent: 1.0, curveShape: .linear,
+                     maxRPMPercent: 1.0, alwaysOn: true, curveShape: .linear,
                      rampUpPerSec: 1.0, rampDownPerSec: 0.025,
                      sustainedTriggerSec: 5, instantEngage: true)
     )
 
-    /// Smart: proactive S-curve with rate-of-change awareness.
-    /// Starts 2°C earlier (53°C) to get ahead of rising temps.
-    /// Uses calibration data when available. 6-second sustained trigger.
-    public static let smart = FanProfile(
-        id: "smart",
-        name: "Smart",
-        curve: Curve(stopTemp: 50, startTemp: 53, ceilingTemp: 85,
-                     maxRPMPercent: 1.0, curveShape: .sCurve,
-                     rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 6)
-    )
-
     public static let builtIn: [FanProfile] = [silent, balanced, performance, max]
 
-    /// Resolve a persisted profile id to a known profile for launch restore. Searches the
-    /// built-ins plus Smart (which is surfaced via its own button, so it isn't in
-    /// `builtIn`). Returns Silent when the id is nil (nothing saved) or unrecognized (a
-    /// profile removed or renamed in a later version), so a stale saved id never crashes.
+    /// Resolve a persisted profile id to a known profile for launch restore. Returns
+    /// Silent when the id is nil (nothing saved) or unrecognized (a profile removed or
+    /// renamed in a later version — e.g. a save left over from the removed Smart
+    /// profile), so a stale saved id never crashes.
     public static func selectable(id: String?) -> FanProfile {
         guard let id else { return .silent }
-        return (builtIn + [smart]).first { $0.id == id } ?? .silent
+        return builtIn.first { $0.id == id } ?? .silent
     }
 }
 

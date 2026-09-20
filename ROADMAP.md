@@ -2,18 +2,6 @@
 
 ## Built Features
 
-### Smart Profile (Built)
-
-Proactive thermal curve that monitors temperature velocity and ramps fans before throttling occurs. Targets 85°C ceiling. Works on every machine without calibration.
-
-- Proportional S-curve from 53°C (start) to 85°C (ceiling)
-- All profiles share 50°C off threshold, matching Apple's observed behavior
-- 6-second sustained trigger filters transient spikes
-- Rate-of-change awareness: ramps harder when temp is rising, eases off slowly when falling
-- Per-profile ramp governors for acoustic comfort (MAX31760, Microchip AN771)
-- 3°C hysteresis (stop at 50°C, start at 53°C)
-
-
 ### Thermal Logging (Built)
 
 Research-grade data export: `thermalforge log`
@@ -60,7 +48,7 @@ Thermal polling now runs at 100ms (matching Apple's thermalmonitord) for smooth 
 | Cadence | Interval | Operations |
 |---|---|---|
 | **Thermal tick** | 100ms | Read temps, calculate curve, apply ramp governor, write fan speed |
-| **Monitor tick** | 2 seconds (every 20th tick) | Process capture (sysctl), anomaly detection, temp history for Smart |
+| **Monitor tick** | 2 seconds (every 20th tick) | Process capture (sysctl), anomaly detection |
 | **UI update** | 500ms (every 5th tick) | Push status to SwiftUI menu bar |
 
 ### Profile curve design
@@ -74,7 +62,7 @@ Each profile has three zones and a per-profile curve shape:
 **Curve shapes:**
 - **Ease-in** (pos²): quiet at low temps, ramps harder as heat builds — used by Balanced
 - **Linear** (pos): direct proportional response — used by Performance
-- **S-curve** (pos²(3-2pos)): smooth at both ends — used by Smart
+- **S-curve** (pos²(3-2pos)): smooth at both ends
 - **Instant engage**: binary on/off, no proportional curve — used by Max
 
 ### Profile specifications
@@ -84,8 +72,7 @@ Each profile has three zones and a per-profile curve shape:
 | **Silent** | N/A | N/A | N/A | Apple | N/A | N/A | N/A | N/A |
 | **Balanced** | 50°C | 55°C | 70°C | 60% | Ease-in | 8s | ~400 RPM/s | ~200 RPM/s |
 | **Performance** | 50°C | 55°C | 65°C | 85% | Linear | 4s | ~800 RPM/s | ~300 RPM/s |
-| **Max** | 50°C | 65°C | — | 100% | Instant | 5s | Instant | ~200 RPM/s |
-| **Smart** | 50°C | 53°C | 85°C | 100% | S-curve | 6s | ~400 RPM/s | ~200 RPM/s |
+| **Max** | N/A | N/A | N/A | 100% | Always on | N/A | N/A | N/A |
 
 **Balanced example curve (55-70°C, ease-in, 0-60% of max RPM):**
 - 55°C (after 8s sustained): fans jump to minimum RPM (2317)
@@ -98,22 +85,11 @@ Each profile has three zones and a per-profile curve shape:
 The ease-in curve keeps Balanced quiet at low temperatures — at the midpoint, fans are at only 15% instead of the 30% a linear curve would give.
 
 **Max behavior:**
-- Below 50°C: fans off
-- 50-65°C: hysteresis — fans maintain current state
-- 5 seconds sustained above 65°C: **instant jump to 100%** — no ramp governor, no proportional curve
-- Temperature drops below 65°C: ramp-down governor at ~200 RPM/s lets temps stabilize
-- Below 50°C and rate-of-change ≤ 0: fans off
+- Always-on: fans pinned at 100% at any temperature — no trigger, no hysteresis, no proportional zone
+- Engages within one thermal tick (~100ms) of selecting the profile
+- Stays at 100% until another profile (or Default) takes over
 
 **Silent (Apple Default)** is purely hands-off: ThermalForge monitors temperatures but Apple controls the fans entirely.
-
-### Smart curve
-
-Smart uses the same three-zone model with an S-curve shape and:
-- Rate-of-change awareness: if temp is rising, boost fan speed proportionally to the rate and proximity to 85°C ceiling
-- Conservative S-curve as default (no calibration required)
-- 6-second sustained trigger — proactive but filtered
-- Future: calibration data and runtime learning can refine the curve (see Planned Features)
-- Temperature anomaly logging with process capture (>10°C in 30s)
 
 ### What was built
 
@@ -127,26 +103,13 @@ Smart uses the same three-zone model with an S-curve shape and:
 8. Redesigned Max as "attack dog": instant 100% at 65°C, gentle ramp-down governor
 9. Redesigned Balanced with ease-in curve for quiet low-temp operation
 10. Redesigned Performance with linear curve and 2× ramp-up speed
-11. Updated Smart sustained trigger from 8s to 6s
-12. Updated all tests for new profile parameters, curve shapes, and per-profile behavior
-13. Updated MenuBarView labels: Max shows "65°C instant", others show start→ceiling range
-14. Updated all documentation
+11. Updated all tests for new profile parameters, curve shapes, and per-profile behavior
+12. Updated MenuBarView labels: Max shows "65°C instant", others show start→ceiling range
+13. Updated all documentation
 
 ---
 
 ## Planned Features
-
-### Calibration (Research Tool)
-
-Machine-specific thermal calibration for the Smart profile. Currently available as a CLI-only research command (`sudo thermalforge calibrate`). The stress infrastructure (Metal compute + CPU stress with adaptive intensity) is built and functional — it can spike CPU and GPU load to measure thermal response.
-
-The calibration methodology needs further research to produce data that meaningfully improves Smart's default curve. The fan control industry does not typically pre-calibrate — they use proportional curves with runtime adaptation, which is what Smart already does.
-
-Future direction: runtime learning during normal use, where Smart observes the relationship between fan speed and temperature response during real workloads and refines its curve over time.
-
-### Runtime Learning
-
-During normal use, Smart observes how the machine responds to fan speed changes. Over time, it learns machine-specific thermal characteristics without any stress test. This produces better data than synthetic calibration because it reflects real workloads.
 
 ### Enhanced Logging
 
@@ -167,9 +130,9 @@ Sources: Gamers Nexus methodology, Notebookcheck stress tests, NASA MIL-STD-1540
 Controlled thermal testing framework. No existing macOS tool offers this.
 
 ```bash
-thermalforge experiment --workload cpu --fan smart --duration 10m --label "smart-baseline"
+thermalforge experiment --workload cpu --fan balanced --duration 10m --label "balanced-baseline"
 thermalforge experiment --workload gpu --fan 75%  --duration 10m --label "gpu-fixed-75"
-thermalforge compare smart-baseline gpu-fixed-75
+thermalforge compare balanced-baseline gpu-fixed-75
 ```
 
 - Built-in workloads: CPU, GPU (Metal compute), CPU+GPU combined, idle baseline

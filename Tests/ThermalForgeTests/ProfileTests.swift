@@ -13,15 +13,15 @@ struct ProfileTests {
 
     // MARK: - Launch restore resolution
 
-    @Test("selectable(id:) resolves known profiles, including Smart, and falls back to Silent")
+    @Test("selectable(id:) resolves known profiles and falls back to Silent")
     func selectableResolution() {
         // Every built-in resolves to itself.
         #expect(FanProfile.selectable(id: "silent").id == "silent")
         #expect(FanProfile.selectable(id: "balanced").id == "balanced")
         #expect(FanProfile.selectable(id: "performance").id == "performance")
         #expect(FanProfile.selectable(id: "max").id == "max")
-        // Smart resolves even though it isn't in `builtIn`.
-        #expect(FanProfile.selectable(id: "smart").id == "smart")
+        // Smart was removed; a stale save holding its id falls back to Silent.
+        #expect(FanProfile.selectable(id: "smart").id == "silent")
         // Unknown id (a profile removed in a future version) and nil both fall to Silent.
         #expect(FanProfile.selectable(id: "does-not-exist").id == "silent")
         #expect(FanProfile.selectable(id: nil).id == "silent")
@@ -39,7 +39,6 @@ struct ProfileTests {
         #expect(FanProfile.balanced.curve.stopTemp == 50)
         #expect(FanProfile.performance.curve.stopTemp == 50)
         #expect(FanProfile.max.curve.stopTemp == 50)
-        #expect(FanProfile.smart.curve.stopTemp == 50)
 
         // Balanced: 50-55-70°C, 60% max, ease-in, 8s trigger
         #expect(FanProfile.balanced.curve.startTemp == 55)
@@ -57,20 +56,10 @@ struct ProfileTests {
         #expect(FanProfile.performance.curve.sustainedTriggerSec == 4)
         #expect(FanProfile.performance.curve.instantEngage == false)
 
-        // Max: 50-65-65°C, 100%, instant engage, 5s trigger
-        #expect(FanProfile.max.curve.startTemp == 65)
-        #expect(FanProfile.max.curve.ceilingTemp == 65)
+        // Max: always-on — 100% at any temperature, no trigger, no proportional zone
         #expect(FanProfile.max.curve.maxRPMPercent == 1.0)
+        #expect(FanProfile.max.curve.alwaysOn == true)
         #expect(FanProfile.max.curve.instantEngage == true)
-        #expect(FanProfile.max.curve.sustainedTriggerSec == 5)
-        #expect(FanProfile.max.curve.alwaysOn == false)
-
-        // Smart: 50-53-85°C, 100%, S-curve, 6s trigger
-        #expect(FanProfile.smart.curve.startTemp == 53)
-        #expect(FanProfile.smart.curve.ceilingTemp == 85)
-        #expect(FanProfile.smart.curve.maxRPMPercent == 1.0)
-        #expect(FanProfile.smart.curve.curveShape == .sCurve)
-        #expect(FanProfile.smart.curve.sustainedTriggerSec == 6)
     }
 
     @Test("Four built-in profiles exist")
@@ -90,10 +79,6 @@ struct ProfileTests {
             let decoded = try JSONDecoder().decode(FanProfile.self, from: data)
             #expect(decoded == profile, "Round-trip failed for \(profile.name)")
         }
-        // Also test Smart (not in builtIn but important)
-        let smartData = try JSONEncoder().encode(FanProfile.smart)
-        let smartDecoded = try JSONDecoder().decode(FanProfile.self, from: smartData)
-        #expect(smartDecoded == FanProfile.smart)
     }
 
     @Test("Custom profile saves and loads")
@@ -173,27 +158,15 @@ struct ProfileTests {
         #expect(abs(atMid! - 0.425) < 0.001)
     }
 
-    @Test("Max profile: instant engage returns maxRPMPercent immediately")
-    func maxInstantEngage() {
+    @Test("Max profile: always-on returns 100% at any temperature, any fan state")
+    func maxAlwaysOn() {
         let curve = FanProfile.max.curve
 
-        // Below stop (50°C): fans off
-        #expect(curve.targetPercent(at: 45, fansCurrentlyRunning: false) == nil)
-
-        // In hysteresis (50-65°C), fans not running: stay off
-        #expect(curve.targetPercent(at: 60, fansCurrentlyRunning: false) == nil)
-
-        // In hysteresis (50-65°C), fans running: keep at minimum
-        let hyst = curve.targetPercent(at: 60, fansCurrentlyRunning: true)
-        #expect(hyst != nil)
-        #expect(hyst! == 0.001)
-
-        // At start (65°C): instantEngage → returns 1.0 immediately (no proportional curve)
-        let atStart = curve.targetPercent(at: 65, fansCurrentlyRunning: false)
-        #expect(atStart == 1.0)
-
-        // Above start: still 1.0
-        #expect(curve.targetPercent(at: 80, fansCurrentlyRunning: true) == 1.0)
+        // No off zone, no hysteresis band — temperature is irrelevant.
+        #expect(curve.targetPercent(at: 30, fansCurrentlyRunning: false) == 1.0)
+        #expect(curve.targetPercent(at: 60, fansCurrentlyRunning: false) == 1.0)
+        #expect(curve.targetPercent(at: 60, fansCurrentlyRunning: true) == 1.0)
+        #expect(curve.targetPercent(at: 95, fansCurrentlyRunning: true) == 1.0)
     }
 
     @Test("Silent profile is hands-off")
@@ -201,20 +174,6 @@ struct ProfileTests {
         let curve = FanProfile.silent.curve
         #expect(curve.targetPercent(at: 50, fansCurrentlyRunning: false) == nil)
         #expect(curve.targetPercent(at: 70, fansCurrentlyRunning: false) == nil)
-    }
-
-    @Test("Smart profile has correct curve parameters")
-    func smartCurve() {
-        let smart = FanProfile.smart
-        #expect(smart.curve.stopTemp == 50)
-        #expect(smart.curve.startTemp == 53)
-        #expect(smart.curve.ceilingTemp == 85)
-        #expect(smart.curve.maxRPMPercent == 1.0)
-        #expect(smart.curve.curveShape == .sCurve)
-        #expect(smart.curve.handsOff == false)
-        #expect(smart.curve.alwaysOn == false)
-        #expect(smart.curve.instantEngage == false)
-        #expect(smart.curve.sustainedTriggerSec == 6)
     }
 
     @Test("Balanced hysteresis: fans stay on between stop and start temps")
@@ -288,20 +247,14 @@ struct ProfileTests {
         #expect(FanProfile.performance.curve.rampUpPerSec == 0.10)
         #expect(FanProfile.performance.curve.rampDownPerSec == 0.04)
 
-        // Max: instant engage (rampUp ignored), gentle ramp-down
-        #expect(FanProfile.max.curve.instantEngage == true)
+        // Max: always-on at 100% — ramp governors never engage while pinned
+        #expect(FanProfile.max.curve.alwaysOn == true)
         #expect(FanProfile.max.curve.rampDownPerSec == 0.025)
-
-        // Smart: same base as Balanced (adaptive logic modifies at runtime)
-        #expect(FanProfile.smart.curve.rampUpPerSec == 0.05)
-        #expect(FanProfile.smart.curve.rampDownPerSec == 0.025)
     }
 
     @Test("Per-profile sustained trigger durations")
     func perProfileSustainedTriggers() {
         #expect(FanProfile.balanced.curve.sustainedTriggerSec == 8)     // Conservative
         #expect(FanProfile.performance.curve.sustainedTriggerSec == 4)  // Responsive
-        #expect(FanProfile.max.curve.sustainedTriggerSec == 5)          // Attack dog threshold
-        #expect(FanProfile.smart.curve.sustainedTriggerSec == 6)        // Proactive
     }
 }

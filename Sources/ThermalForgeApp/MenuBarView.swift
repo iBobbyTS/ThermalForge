@@ -104,22 +104,29 @@ struct MenuBarView: View {
                         Text(profile.name)
                         Spacer()
                         if !profile.curve.handsOff {
-                            let unit = appState.useFahrenheit ? "F" : "C"
-                            if profile.curve.instantEngage {
-                                // Max: show instant trigger temp
-                                let startC = profile.curve.startTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                Text("\(Int(startDisp))°\(unit) instant")
+                            if profile.curve.alwaysOn {
+                                // Max: always 100%, no temperature conditions
+                                Text("100% always")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             } else {
-                                let startC = profile.curve.startTemp
-                                let ceilC = profile.curve.ceilingTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                let ceilDisp = appState.useFahrenheit ? ceilC * 9 / 5 + 32 : ceilC
-                                Text("\(Int(startDisp))→\(Int(ceilDisp))°\(unit)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                let unit = appState.useFahrenheit ? "F" : "C"
+                                if profile.curve.instantEngage {
+                                    // Instant engage: show trigger temp
+                                    let startC = profile.curve.startTemp
+                                    let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
+                                    Text("\(Int(startDisp))°\(unit) instant")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    let startC = profile.curve.startTemp
+                                    let ceilC = profile.curve.ceilingTemp
+                                    let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
+                                    let ceilDisp = appState.useFahrenheit ? ceilC * 9 / 5 + 32 : ceilC
+                                    Text("\(Int(startDisp))→\(Int(ceilDisp))°\(unit)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
@@ -133,34 +140,11 @@ struct MenuBarView: View {
             Divider().padding(.vertical, 4)
 
             // Quick actions
-            HStack(spacing: 8) {
-                // Toggle-as-button holds the system fill while Smart is the active
-                // profile — Apple draws it, it honors .tint, and it adapts to light/dark.
-                Toggle(isOn: Binding(
-                    get: { appState.activeProfile.id == "smart" },
-                    set: { isOn in
-                        if isOn {
-                            appState.setSmart()
-                        } else {
-                            // Turning Smart off returns fans to Apple's default (Silent),
-                            // same as the Default button. Required so the toggle can turn
-                            // off at all — otherwise `get` stays true and snaps it back on.
-                            appState.resetAuto()
-                        }
-                    }
-                )) {
-                    Label("Smart", systemImage: "fan.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .toggleStyle(.button)
-                .tint(.orange)
-
-                Button(action: { appState.resetAuto() }) {
-                    Label("Default", systemImage: "arrow.counterclockwise")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+            Button(action: { appState.resetAuto() }) {
+                Label("Default", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
             .padding(.horizontal, 12)
 
             Divider().padding(.vertical, 4)

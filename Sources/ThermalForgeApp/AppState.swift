@@ -158,9 +158,10 @@ final class AppState: ObservableObject {
                 // Restore the user's last chosen profile, but NEVER over a reflected CLI
                 // hold — that hold is the most recent explicit intent and wins. With no
                 // hold (including the crash-recovery branch above that just cleared a
-                // stale app hold), apply the saved choice, so a crash while Smart was
-                // running comes back to Smart. Deferred to here so the hold state is known
-                // before any fan command is issued (no pre-adopt commands in the window).
+                // stale app hold), apply the saved choice, so a crash while a profile
+                // was running comes back to that profile. Deferred to here so the hold
+                // state is known before any fan command is issued (no pre-adopt commands
+                // in the window).
                 if adopted == nil {
                     let restored = self.restoredProfile()
                     self.activeProfile = restored
@@ -386,24 +387,12 @@ final class AppState: ObservableObject {
         return had
     }
 
-    func setSmart() {
-        let took = seizeControl()
-        activeProfile = .smart
-        persistSelectedProfile(FanProfile.smart.id)
-        monitor?.switchProfile(.smart)
-        // Taking over a CLI hold: clear it so the unsupervised hold isn't
-        // orphaned; the Smart tick then establishes supervised control. Off-main
-        // one-shot on the pump (never coalesced/reordered).
-        if took { commandPump.submit(.resetAuto) }
-        TFLogger.shared.profile("Smart activated")
-    }
-
     func resetAuto() {
         seizeControl()
         // resetAuto clears any hold (CLI or app) → daemon .none. This is the
         // no-CLI-knowledge way out of a pinned CLI hold: the Default button, and
-        // the escape for someone with loud fans. Unlike setSmart/selectProfile
-        // (where the monitor keeps working and retries every tick), Default takes
+        // the escape for someone with loud fans. Unlike selectProfile (where the
+        // monitor keeps working and retries every tick), Default takes
         // the monitor hands-off — so it must NOT claim success it didn't get.
         // Send the reset off-main and reflect Silent ONLY once the daemon confirms;
         // on failure, leave the current profile active (so the monitor keeps trying)
@@ -436,7 +425,7 @@ final class AppState: ObservableObject {
         // a CLI hold (so its unsupervised hold isn't orphaned). Otherwise active
         // profiles let tick() ramp from the current temperature. Off-main one-shot
         // on the pump (never coalesced/reordered).
-        if profile.curve.handsOff || profile.id == "smart" || profile.id == "silent" || took {
+        if profile.curve.handsOff || took {
             commandPump.submit(.resetAuto)
         }
     }
@@ -444,7 +433,7 @@ final class AppState: ObservableObject {
     // MARK: - Profile persistence
 
     /// The user's last explicitly-chosen profile id, so the app reopens to it instead of
-    /// always Silent. Written ONLY on a user click (picker, Smart, Default) via
+    /// always Silent. Written ONLY on a user click (picker, Default) via
     /// `persistSelectedProfile`, never on the monitor's per-tick echo of `activeProfile`
     /// or on watchdog / thermal-floor / crash-recovery fan resets.
     private static let selectedProfileKey = "selectedProfile"

@@ -6,3 +6,7 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 ThermalForge.iconset/
+
+# AI Agent
+.codegraph
+.agent-work

@@ -22,7 +22,6 @@ struct ThermalForge: ParsableCommand {
             Status.self,
             Discover.self,
             Watch.self,
-            Calibrate.self,
             Log.self,
             Install.self,
             Uninstall.self,
@@ -420,110 +419,6 @@ struct Watch: ParsableCommand {
 
         // Keep the process alive
         RunLoop.main.run()
-    }
-}
-
-// MARK: - Calibrate
-
-struct Calibrate: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "calibrate",
-        abstract: "Measure this machine's thermal characteristics for the Smart profile"
-    )
-
-    @Option(name: .shortAndLong, help: "Calibration mode: quick (~14 min), standard (~32 min), optimized (until stable)")
-    var mode: String = "standard"
-
-    @Option(name: .shortAndLong, help: "Stress type: combined (CPU+GPU, default), cpu, gpu")
-    var stress: String = "combined"
-
-    @Flag(name: .long, help: "Clear calibration data and start fresh")
-    var reset: Bool = false
-
-    func run() throws {
-        // Reset doesn't need sudo — it's user data
-        if reset {
-            if CalibrationData.exists {
-                try? FileManager.default.removeItem(at: CalibrationData.filePath)
-                print("Calibration data cleared. Smart will use the default curve.")
-                TFLogger.shared.calibration("Calibration data reset by user")
-            } else {
-                print("No calibration data to clear.")
-            }
-            return
-        }
-
-        guard geteuid() == 0 else {
-            throw ValidationError("Run with sudo: sudo thermalforge calibrate")
-        }
-
-        guard let calMode = CalibrationMode(rawValue: mode) else {
-            throw ValidationError("Unknown mode '\(mode)'. Options: quick, standard, optimized")
-        }
-
-        guard let calStress = CalibrationStressType(rawValue: stress) else {
-            throw ValidationError("Unknown stress type '\(stress)'. Options: combined, cpu, gpu")
-        }
-
-        // Prevent downgrade
-        if CalibrationRunner.wouldDowngrade(mode: calMode) {
-            let existing = CalibrationData.load()
-            let existingMode = existing?.mode ?? "unknown"
-            throw ValidationError(
-                "Existing calibration was run at '\(existingMode)' level. " +
-                "Running '\(mode)' would downgrade your data. " +
-                "Use --mode \(existingMode) or higher."
-            )
-        }
-
-        print("ThermalForge Calibration")
-        print("========================")
-        print("Mode: \(calMode.description)")
-        print("Stress: \(calStress.description)")
-        print("")
-        print("This will stress your \(calStress == .combined ? "CPU and GPU" : calStress == .cpu ? "CPU" : "GPU") and measure thermal response at 5 fan speed levels.")
-        print("Fans will be loud during the test.")
-        print("")
-        print("DISCLAIMER: Calibration pushes your Mac to full load and cycles fan speeds.")
-        print("This is within normal operating parameters but ThermalForge is provided")
-        print("as-is with no warranty. Use at your own risk.")
-        print("")
-        print("Press Ctrl-C at any time to stop. Fans will reset to Apple defaults.\n")
-
-        let fc = try FanControl()
-        let runner = CalibrationRunner(fanControl: fc, mode: calMode, stressType: calStress)
-
-        // Kill switch: Ctrl-C resets fans and exits cleanly
-        signal(SIGINT) { _ in
-            print("\n\nCalibration interrupted. Resetting fans to Apple defaults...")
-            if let resetFC = try? FanControl() {
-                try? resetFC.resetAuto()
-            }
-            print("Fans reset. No calibration data was saved.")
-            Darwin.exit(0)
-        }
-
-        runner.onProgress = { message in
-            print(message)
-        }
-
-        let data = try runner.run()
-        try data.save()
-
-        print("\nCalibration complete.")
-        print("\nSaved to:")
-        print("  \(CalibrationData.filePath.path)")
-        if let logPath = runner.logPath {
-            print("  \(logPath.path)")
-        }
-        print("\nResults:")
-        for m in data.measurements {
-            print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
-        }
-        print("\nThe Smart profile will now use these measurements for this machine.")
-        if runner.logPath != nil {
-            print("The CSV log contains every sensor reading taken during calibration.")
-        }
     }
 }
 
@@ -1104,7 +999,7 @@ struct Uninstall: ParsableCommand {
         try? fm.removeItem(atPath: "/Applications/ThermalForge.app")
 
         print("ThermalForge fully uninstalled.")
-        print("Removed: daemon, binary, app, calibration data, logs.")
+        print("Removed: daemon, binary, app, user data, logs.")
     }
 }
 
