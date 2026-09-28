@@ -77,6 +77,12 @@ public final class ThermalMonitor {
     private var fansCurrentlyRunning = false
     private var sustainedAboveCount = 0
 
+    // MARK: - Safety Override
+
+    /// Decides engage/hold/release for the 95°C override (hands-off exemption,
+    /// sustained-heat filter, real release hysteresis). See SafetyOverrideGate.
+    private var safetyGate = SafetyOverrideGate()
+
     // MARK: - Anomaly Detection
 
     /// Tracks temps over 30 seconds (15 readings at 2s monitor cadence)
@@ -122,12 +128,19 @@ public final class ThermalMonitor {
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
+            // Switching out of an ACTIVE safety override keeps the ramp position,
+            // so the new profile's governor eases DOWN from max; resetting to 0
+            // would slam fans to minimum in one tick mid-thermal-event.
+            let wasOverride = state == .safetyOverride
             activeProfile = profile
-            lastAppliedRPMPercent = 0
-            fansCurrentlyRunning = false
+            lastAppliedRPMPercent = wasOverride ? 1.0 : 0
+            fansCurrentlyRunning = wasOverride
             sustainedAboveCount = 0
             tickCounter = 0
             state = .idle
+            safetyGate = SafetyOverrideGate(
+                sustainTicks: Int((FanProfile.safetySustainSeconds / tickInterval).rounded())
+            )
         }
     }
 
@@ -146,15 +159,26 @@ public final class ThermalMonitor {
             monitorTick(status: status, maxTemp: maxTemp)
         }
 
-        // Safety override: any sensor > 95°C
-        if maxTemp >= FanProfile.safetyTempThreshold {
-            if state != .safetyOverride {
-                applyCommand(.setMax)
-                state = .safetyOverride
-                fansCurrentlyRunning = true
-                lastAppliedRPMPercent = 1.0
-                TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
-            }
+        // Safety override — decided by the pure SafetyOverrideGate: hands-off
+        // profiles never engage (Apple's own curve is the safety there),
+        // engagement needs SUSTAINED heat (a single-core boost spike is not an
+        // emergency), and release waits for the hysteresis point — the [90, 95)
+        // band HOLDS max instead of handing control back at the first
+        // sub-threshold tick (the Silent-mode bang-bang this replaces).
+        let safetyAction = safetyGate.evaluate(handsOff: activeProfile.curve.handsOff, temp: maxTemp)
+
+        if safetyAction == .engage {
+            applyCommand(.setMax)
+            state = .safetyOverride
+            fansCurrentlyRunning = true
+            lastAppliedRPMPercent = 1.0
+            TFLogger.shared.safety(
+                "Override triggered: \(String(format: "%.1f", maxTemp))°C sustained "
+                    + "\(Int(FanProfile.safetySustainSeconds.rounded()))s — fans maxed [\(activeProfile.name)]"
+            )
+        }
+
+        if safetyAction == .engage || safetyAction == .hold {
             if tickCounter % Self.uiUpdateCadence == 0 {
                 onUpdate?(status, activeProfile, state)
             }
@@ -162,11 +186,13 @@ public final class ThermalMonitor {
             return
         }
 
-        // Clear safety override with hysteresis
-        if state == .safetyOverride
-            && maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees
-        {
+        if safetyAction == .release {
             state = .idle
+            TFLogger.shared.safety(
+                "Override cleared at \(String(format: "%.1f", maxTemp))°C — resuming \(activeProfile.name)"
+            )
+            // Fall through: tickCurve resumes the profile, and its ramp-down
+            // governor eases fans off max instead of dropping them.
         }
 
         // Sustained trigger: track consecutive ticks above start threshold.

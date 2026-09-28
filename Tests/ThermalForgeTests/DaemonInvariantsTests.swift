@@ -56,17 +56,37 @@ struct DaemonInvariantsTests {
 
     // MARK: - Thermal floor decision
 
-    @Test("engages only when overheating AND a below-max hold is active")
+    @Test("engages only when overheating is SUSTAINED and a below-max hold is active")
     func thermalFloorEngage() {
-        let floor = ThermalFloor()   // 95 / 90 from FanProfile
-        #expect(floor.evaluate(temp: 95, holdCommand: "set 2000", suspended: false) == .engage)
+        let floor = ThermalFloor()   // 95 / 90 / 2-sample sustain from FanProfile
+        // One hot sample — a per-core boost spike — must not engage…
+        #expect(floor.evaluate(temp: 95, holdCommand: "set 2000", suspended: false) == .none)
+        // …but two consecutive hot samples while a below-max hold pins fans do.
         #expect(floor.evaluate(temp: 96, holdCommand: "setfan 1 1500", suspended: false) == .engage)
-        // No hold (auto) → Apple's auto + client monitor own it.
-        #expect(floor.evaluate(temp: 99, holdCommand: nil, suspended: false) == .none)
+
+        // No hold (auto) → Apple's auto + client monitor own it, even sustained.
+        let auto = ThermalFloor()
+        #expect(auto.evaluate(temp: 99, holdCommand: nil, suspended: false) == .none)
+        #expect(auto.evaluate(temp: 99, holdCommand: nil, suspended: false) == .none)
+
         // Already max → nothing to override.
-        #expect(floor.evaluate(temp: 99, holdCommand: "max", suspended: false) == .none)
+        let maxed = ThermalFloor()
+        #expect(maxed.evaluate(temp: 99, holdCommand: "max", suspended: false) == .none)
+        #expect(maxed.evaluate(temp: 99, holdCommand: "max", suspended: false) == .none)
+
         // Below threshold → none.
-        #expect(floor.evaluate(temp: 94.9, holdCommand: "set 2000", suspended: false) == .none)
+        let cool = ThermalFloor()
+        #expect(cool.evaluate(temp: 94.9, holdCommand: "set 2000", suspended: false) == .none)
+        #expect(cool.evaluate(temp: 94.9, holdCommand: "set 2000", suspended: false) == .none)
+    }
+
+    @Test("a cool sample between hot samples resets the streak (spike over)")
+    func thermalFloorStreakResets() {
+        let floor = ThermalFloor()
+        #expect(floor.evaluate(temp: 95.5, holdCommand: "set 2000", suspended: false) == .none)
+        #expect(floor.evaluate(temp: 94.9, holdCommand: "set 2000", suspended: false) == .none)  // spike over
+        #expect(floor.evaluate(temp: 96.0, holdCommand: "set 2000", suspended: false) == .none)   // streak restarted
+        #expect(floor.evaluate(temp: 96.0, holdCommand: "set 2000", suspended: false) == .engage)
     }
 
     @Test("restores only after cooling past the hysteresis point")
@@ -86,5 +106,6 @@ struct DaemonInvariantsTests {
         let floor = ThermalFloor()
         #expect(floor.threshold == FanProfile.safetyTempThreshold)
         #expect(floor.clearBelow == FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees)
+        #expect(floor.sustainSamples == max(1, Int(FanProfile.safetySustainSeconds.rounded())))
     }
 }

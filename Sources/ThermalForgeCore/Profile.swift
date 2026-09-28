@@ -269,4 +269,10 @@ extension FanProfile {
     public static let safetyTempThreshold: Float = 95.0
     /// Hysteresis deadband to prevent oscillation
     public static let hysteresisDegrees: Float = 5.0
+    /// How long the peak sensor must STAY at/above the threshold before the
+    /// safety override engages. Single P-core boost spikes touch 95°C+ for well
+    /// under a second while the package is fine — Apple Silicon design behavior,
+    /// not an emergency. Thermal mass makes a 2-second filter free in a real one.
+    /// Shared by the client monitor (SafetyOverrideGate) and the daemon's floor.
+    public static let safetySustainSeconds: Float = 2.0
 }

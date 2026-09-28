@@ -42,14 +42,27 @@ public struct RateLimiter {
 /// The thermal safety floor's decision, given a sampled temperature and the current
 /// hold/suspension state. Thresholds are mirrored from `FanProfile` (read, not
 /// invented). The DaemonServer maps `.engage`/`.restore` onto SMC + `safetySuspended`.
-public struct ThermalFloor {
+///
+/// A class (not a struct): engagement requires a streak of consecutive hot samples,
+/// so `evaluate` carries that decision state. Still effect-free — the daemon
+/// performs every SMC write.
+public final class ThermalFloor {
     public let threshold: Float
     public let clearBelow: Float
+    /// Consecutive hot samples required before engaging. Mirrors
+    /// `FanProfile.safetySustainSeconds` (thermalTick samples at 1s, so seconds ==
+    /// samples): a single per-core boost spike touching 95°C must not yank the
+    /// fans to max and back.
+    public let sustainSamples: Int
+
+    private var hotStreak = 0
 
     public init(threshold: Float = FanProfile.safetyTempThreshold,
-                hysteresis: Float = FanProfile.hysteresisDegrees) {
+                hysteresis: Float = FanProfile.hysteresisDegrees,
+                sustainSamples: Int = max(1, Int(FanProfile.safetySustainSeconds.rounded()))) {
         self.threshold = threshold
         self.clearBelow = threshold - hysteresis
+        self.sustainSamples = max(1, sustainSamples)
     }
 
     public enum Action: Equatable {
@@ -65,9 +78,15 @@ public struct ThermalFloor {
             // Restore only once cooled past the hysteresis point; otherwise keep max.
             return temp < clearBelow ? .restore : .none
         }
-        // Engage only when overheating AND a hold pins fans below max. No hold (auto)
-        // or an already-max hold needs no override.
-        guard temp >= threshold, let cmd = holdCommand, cmd != "max" else { return .none }
+        guard temp >= threshold else {
+            hotStreak = 0
+            return .none
+        }
+        // Engage only when overheating is SUSTAINED and a hold pins fans below
+        // max. No hold (auto) or an already-max hold needs no override.
+        hotStreak += 1
+        guard hotStreak >= sustainSamples, let cmd = holdCommand, cmd != "max" else { return .none }
+        hotStreak = 0
         return .engage
     }
 }

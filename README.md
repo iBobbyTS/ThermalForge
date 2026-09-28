@@ -26,7 +26,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 | Thermal data logging (CSV) | **Yes** | No | Yes |
 | Process correlation in logs | **Yes** | No | No |
 | Sleep/wake re-apply | Yes | Yes | Yes |
-| Safety override (95°C) | **Yes — daemon-enforced, works with app closed** | No | Requires manual setup |
+| Safety override (95°C, sustained) | **Yes — daemon-enforced, works with app closed** | No | Requires manual setup |
 | Crash recovery (heartbeat watchdog) | **Yes — daemon-enforced, holds during overheat** | Reverts on quit only | Override removes macOS safety |
 | Open source | **Yes** | No | No |
 | Price | **Free** | $15 | $20 |
@@ -46,7 +46,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 - Thermal logging — CSV + JSON data export with process correlation for research
 - Automatic fan re-apply after sleep/wake
 - Fahrenheit / Celsius toggle
-- Safety override: the background daemon forces fans to maximum if a critical sensor crosses 95°C while a manual hold is keeping them too low — enforced in the daemon, so it works even with the menu bar app closed
+- Safety override: fans go to maximum when a critical sensor *stays* above 95°C for 2 seconds while a manual hold is keeping them too low — a momentary single-core boost spike won't trigger it. Enforced in the daemon (works with the app closed) and mirrored in the app's monitor with a 5°C release hysteresis. In Silent (Apple Default) ThermalForge never seizes control at all: Apple's own thermal management is the safety there
 - Crash recovery: the daemon's heartbeat watchdog resets fans to Apple defaults if the app dies — and if a thermal safety override is active, it holds fans at max and defers the reset until the machine cools, so it never hands hot fans back to auto
 - Temperature anomaly detection: logs instant spikes (>5°C in 2s) and sustained changes (>10°C in 30s) with process capture
 - Privileged daemon — one-time sudo, zero password prompts after
@@ -114,7 +114,7 @@ ThermalForge controls fans through a background daemon, and 0.2.0 locks down how
 
 - **Private control socket.** The daemon listens on `/var/run/thermalforge.sock`, mode `0600`, owned by the user who ran `sudo thermalforge install`. Only that user and root can send fan commands — no other local account can drive your fans.
 - **Structured, versioned protocol.** The CLI, app, and daemon speak a size-capped, versioned message format. Oversized or malformed input is rejected rather than parsed, and a version mismatch surfaces as an "Update needed" prompt instead of silent divergence.
-- **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum if a critical sensor crosses 95°C while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
+- **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum when a critical sensor stays above 95°C for 2 seconds while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
 - **Robust connection handling.** Connections are handled concurrently, bounded, and timed out, so a stuck or slow client can't stall fan control.
 
 ## FAQ
