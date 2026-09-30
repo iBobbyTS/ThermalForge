@@ -409,6 +409,7 @@ final class AppState: ObservableObject {
                 // here, on the daemon-confirmed success path, never on a failed reset.
                 self.persistSelectedProfile(FanProfile.silent.id)
                 self.monitor?.switchProfile(.silent)
+                self.monitor?.resetFanState()
                 TFLogger.shared.profile("Reset to Default (Silent (Apple Default))")
             }
         }
@@ -427,6 +428,9 @@ final class AppState: ObservableObject {
         // on the pump (never coalesced/reordered).
         if profile.curve.handsOff || took {
             commandPump.submit(.resetAuto)
+            // resetAuto hands the fans back to the system — the monitor's
+            // running/last-applied tracker must forget its state too.
+            monitor?.resetFanState()
         }
     }
 

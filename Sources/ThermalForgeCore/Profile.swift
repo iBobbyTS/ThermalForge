@@ -5,7 +5,7 @@
 //  Fan control profiles with proportional temperature curves.
 //
 //  Each profile defines a curve that maps temperature to fan speed,
-//  along with per-profile ramp rates, sustained triggers, and curve shapes.
+//  along with per-profile ramp rates and curve shapes.
 //
 //  Based on Apple fan hardware research:
 //  - 0 to minimum RPM is binary (hardware limitation)
@@ -40,11 +40,13 @@ public struct FanProfile: Codable, Identifiable, Equatable {
 
     /// Defines how the profile maps temperature to fan speed.
     public struct Curve: Codable, Equatable {
-        /// Below this temperature, fans turn off (return to Apple auto).
+        /// Below this temperature, fans turn off — but only after
+        /// stopSustainSeconds of sustained cold (see FanOffGate); an instant
+        /// release would bang-bang on idle-core sensor cliffs.
         /// Must be at least 5°C below startTemp for hysteresis.
         public let stopTemp: Float
 
-        /// Above this temperature, fans engage (after sustained trigger is met).
+        /// Above this temperature, fans engage.
         public let startTemp: Float
 
         /// Temperature at which fan speed reaches maxRPMPercent.
@@ -70,10 +72,6 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         /// Max fan speed decrease per second (fraction of max RPM per second).
         public let rampDownPerSec: Float
 
-        /// Seconds of sustained temperature above startTemp before fans engage.
-        /// Filters transient spikes that resolve on their own.
-        public let sustainedTriggerSec: Float
-
         /// If true, skip ramp-up governor — jump directly to maxRPMPercent.
         /// Ramp-down governor still applies for smooth deceleration.
         public let instantEngage: Bool
@@ -81,7 +79,7 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         public init(stopTemp: Float = 50, startTemp: Float = 55, ceilingTemp: Float = 70,
                     maxRPMPercent: Float = 0.6, handsOff: Bool = false, alwaysOn: Bool = false,
                     curveShape: CurveShape = .linear, rampUpPerSec: Float = 0.05,
-                    rampDownPerSec: Float = 0.025, sustainedTriggerSec: Float = 8,
+                    rampDownPerSec: Float = 0.025,
                     instantEngage: Bool = false) {
             self.stopTemp = stopTemp
             self.startTemp = startTemp
@@ -92,7 +90,6 @@ public struct FanProfile: Codable, Identifiable, Equatable {
             self.curveShape = curveShape
             self.rampUpPerSec = rampUpPerSec
             self.rampDownPerSec = rampDownPerSec
-            self.sustainedTriggerSec = sustainedTriggerSec
             self.instantEngage = instantEngage
         }
 
@@ -179,25 +176,22 @@ extension FanProfile {
 
     /// Balanced: gentle ease-in curve for everyday use.
     /// Quiet at low temps (pos²), ramps harder as heat builds.
-    /// 8-second sustained trigger filters all transients.
     public static let balanced = FanProfile(
         id: "balanced",
         name: "Balanced",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 70,
                      maxRPMPercent: 0.60, curveShape: .easeIn,
-                     rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 8)
+                     rampUpPerSec: 0.05, rampDownPerSec: 0.025)
     )
 
     /// Performance: linear curve, fast response. Thermals over noise.
-    /// 4-second sustained trigger, 2× ramp-up speed vs Balanced.
+    /// 2× ramp-up speed vs Balanced.
     public static let performance = FanProfile(
         id: "performance",
         name: "Performance",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 65,
                      maxRPMPercent: 0.85, curveShape: .linear,
-                     rampUpPerSec: 0.10, rampDownPerSec: 0.04,
-                     sustainedTriggerSec: 4)
+                     rampUpPerSec: 0.10, rampDownPerSec: 0.04)
     )
 
     /// Max: fans pinned at 100%, no temperature conditions. Selecting it means
@@ -208,7 +202,7 @@ extension FanProfile {
         curve: Curve(stopTemp: 50, startTemp: 65, ceilingTemp: 65,
                      maxRPMPercent: 1.0, alwaysOn: true, curveShape: .linear,
                      rampUpPerSec: 1.0, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 5, instantEngage: true)
+                     instantEngage: true)
     )
 
     public static let builtIn: [FanProfile] = [silent, balanced, performance, max]
@@ -275,4 +269,14 @@ extension FanProfile {
     /// not an emergency. Thermal mass makes a 2-second filter free in a real one.
     /// Shared by the client monitor (SafetyOverrideGate) and the daemon's floor.
     public static let safetySustainSeconds: Float = 2.0
+    /// How long the peak sensor must STAY at/below stopTemp before fans are
+    /// handed back to Apple's auto mode — the release-direction mirror of
+    /// safetySustainSeconds. The peak is a max over all CPU/GPU cores, and an
+    /// idle core's reading drops 20-30°C the instant its workload ends, so with
+    /// stopTemp at idle-core resting level the peak oscillates across the
+    /// threshold on a 100ms scale; an instant release there handed the fans to
+    /// Apple mid-ramp 2,182 times in three days of logs (fans slamming
+    /// 3000+→1300 RPM every 3-7 seconds — the start/stop cycling that is the
+    /// #1 bearing wear factor). Until cold is confirmed, fans hold at minimum.
+    public static let stopSustainSeconds: Float = 5.0
 }

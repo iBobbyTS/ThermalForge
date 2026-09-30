@@ -40,23 +40,21 @@ struct ProfileTests {
         #expect(FanProfile.performance.curve.stopTemp == 50)
         #expect(FanProfile.max.curve.stopTemp == 50)
 
-        // Balanced: 50-55-70°C, 60% max, ease-in, 8s trigger
+        // Balanced: 50-55-70°C, 60% max, ease-in
         #expect(FanProfile.balanced.curve.startTemp == 55)
         #expect(FanProfile.balanced.curve.ceilingTemp == 70)
         #expect(FanProfile.balanced.curve.maxRPMPercent == 0.60)
         #expect(FanProfile.balanced.curve.curveShape == .easeIn)
-        #expect(FanProfile.balanced.curve.sustainedTriggerSec == 8)
         #expect(FanProfile.balanced.curve.instantEngage == false)
 
-        // Performance: 50-55-65°C, 85% max, linear, 4s trigger
+        // Performance: 50-55-65°C, 85% max, linear
         #expect(FanProfile.performance.curve.startTemp == 55)
         #expect(FanProfile.performance.curve.ceilingTemp == 65)
         #expect(FanProfile.performance.curve.maxRPMPercent == 0.85)
         #expect(FanProfile.performance.curve.curveShape == .linear)
-        #expect(FanProfile.performance.curve.sustainedTriggerSec == 4)
         #expect(FanProfile.performance.curve.instantEngage == false)
 
-        // Max: always-on — 100% at any temperature, no trigger, no proportional zone
+        // Max: always-on — 100% at any temperature, no proportional zone
         #expect(FanProfile.max.curve.maxRPMPercent == 1.0)
         #expect(FanProfile.max.curve.alwaysOn == true)
         #expect(FanProfile.max.curve.instantEngage == true)
@@ -88,7 +86,7 @@ struct ProfileTests {
             name: "Test Custom",
             curve: FanProfile.Curve(stopTemp: 45, startTemp: 55, ceilingTemp: 65,
                                     maxRPMPercent: 0.50, curveShape: .easeOut,
-                                    rampUpPerSec: 0.08, sustainedTriggerSec: 3)
+                                    rampUpPerSec: 0.08)
         )
 
         try custom.save()
@@ -100,7 +98,6 @@ struct ProfileTests {
         #expect(found?.curve.maxRPMPercent == 0.50)
         #expect(found?.curve.curveShape == .easeOut)
         #expect(found?.curve.rampUpPerSec == 0.08)
-        #expect(found?.curve.sustainedTriggerSec == 3)
 
         // Clean up
         let path = FileManager.default.homeDirectoryForCurrentUser
@@ -252,9 +249,20 @@ struct ProfileTests {
         #expect(FanProfile.max.curve.rampDownPerSec == 0.025)
     }
 
-    @Test("Per-profile sustained trigger durations")
-    func perProfileSustainedTriggers() {
-        #expect(FanProfile.balanced.curve.sustainedTriggerSec == 8)     // Conservative
-        #expect(FanProfile.performance.curve.sustainedTriggerSec == 4)  // Responsive
+    @Test("Legacy profile JSON with removed sustainedTriggerSec key still decodes")
+    func legacyJSONCompat() throws {
+        // sustainedTriggerSec was removed; profiles saved by older versions carry
+        // the extra key and must keep loading (synthesized Codable ignores it).
+        let legacyJSON = """
+        {"id":"legacy","name":"Legacy","curve":{"stopTemp":45,"startTemp":55,
+        "ceilingTemp":65,"maxRPMPercent":0.5,"handsOff":false,"alwaysOn":false,
+        "curveShape":"easeOut","rampUpPerSec":0.08,"rampDownPerSec":0.03,
+        "sustainedTriggerSec":3,"instantEngage":false}}
+        """
+        let decoded = try JSONDecoder().decode(FanProfile.self, from: Data(legacyJSON.utf8))
+        #expect(decoded.id == "legacy")
+        #expect(decoded.curve.startTemp == 55)
+        #expect(decoded.curve.rampUpPerSec == 0.08)
+        #expect(decoded.curve.curveShape == .easeOut)
     }
 }

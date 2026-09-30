@@ -75,13 +75,19 @@ public final class ThermalMonitor {
 
     private var lastAppliedRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
-    private var sustainedAboveCount = 0
 
     // MARK: - Safety Override
 
     /// Decides engage/hold/release for the 95°C override (hands-off exemption,
     /// sustained-heat filter, real release hysteresis). See SafetyOverrideGate.
     private var safetyGate = SafetyOverrideGate()
+
+    // MARK: - Fans-Off Gate
+
+    /// Decides hold/release for the fans-off transition: sustained-cold
+    /// confirmation, so idle-core sensor cliffs can't bang-bang the release
+    /// across stopTemp. See FanOffGate.
+    private var fanOffGate = FanOffGate()
 
     // MARK: - Anomaly Detection
 
@@ -125,22 +131,23 @@ public final class ThermalMonitor {
         timer = nil
     }
 
-    /// Update the active profile.
+    /// Update the active profile. Switching itself sends no fan command: the
+    /// next tick computes the new profile's target from the current temperature
+    /// and the ramp governors move toward it — so the tracked fan state must
+    /// stay truthful here. It is cleared only via resetFanState, at the places
+    /// that actually send a resetAuto and hand fans back to the system.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
-            // Switching out of an ACTIVE safety override keeps the ramp position,
-            // so the new profile's governor eases DOWN from max; resetting to 0
-            // would slam fans to minimum in one tick mid-thermal-event.
-            let wasOverride = state == .safetyOverride
             activeProfile = profile
-            lastAppliedRPMPercent = wasOverride ? 1.0 : 0
-            fansCurrentlyRunning = wasOverride
-            sustainedAboveCount = 0
-            tickCounter = 0
-            state = .idle
-            safetyGate = SafetyOverrideGate(
-                sustainTicks: Int((FanProfile.safetySustainSeconds / tickInterval).rounded())
-            )
+        }
+    }
+
+    /// Forget the tracked fan state — call exactly where a resetAuto is sent:
+    /// that's the only moment fans are handed back to the system.
+    public func resetFanState() {
+        queue.async { [self] in
+            fansCurrentlyRunning = false
+            lastAppliedRPMPercent = 0
         }
     }
 
@@ -193,15 +200,6 @@ public final class ThermalMonitor {
             )
             // Fall through: tickCurve resumes the profile, and its ramp-down
             // governor eases fans off max instead of dropping them.
-        }
-
-        // Sustained trigger: track consecutive ticks above start threshold.
-        // Per-profile duration — converted to tick count at runtime.
-        let startThreshold = activeProfile.curve.startTemp
-        if maxTemp >= startThreshold {
-            sustainedAboveCount += 1
-        } else {
-            sustainedAboveCount = 0
         }
 
         tickCurve(status: status, peakTemp: maxTemp)
@@ -294,31 +292,39 @@ public final class ThermalMonitor {
             return
         }
 
+        // Fans-off gate — evaluated EVERY tick (like the safety gate) so its
+        // cold streak resets the moment the peak leaves the stop band.
+        let offAction = fanOffGate.evaluate(temp: peakTemp, stopTemp: curve.stopTemp)
+
         // Get target from curve (now applies curve shape: easeIn, linear, easeOut, sCurve)
-        guard let rawTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning) else {
-            // Curve says fans should be off
-            if fansCurrentlyRunning {
+        let curveTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning)
+
+        if curveTarget == nil {
+            // Curve says fans should be off — but the release is CONFIRMED, not
+            // instant: an idle core's sensor reading falls off a cliff when its
+            // workload ends, swinging the peak across stopTemp on a 100ms scale.
+            // An instant release there handed the fans to Apple mid-ramp over
+            // and over (2,182 releases in three days of logs — the sudden
+            // 3000+→1300 RPM drops). Until cold is sustained, hold at minimum —
+            // the same treatment the hysteresis band gives.
+            guard fansCurrentlyRunning else { return }
+            if offAction == .release {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false
                 lastAppliedRPMPercent = 0
                 state = .idle
-                TFLogger.shared.fan("Fans off: \(String(format: "%.1f", peakTemp))°C below \(Int(curve.stopTemp))°C [\(activeProfile.name)]")
+                TFLogger.shared.fan(
+                    "Fans off: \(String(format: "%.1f", peakTemp))°C sustained "
+                        + "≤\(Int(curve.stopTemp))°C for \(Int(FanProfile.stopSustainSeconds.rounded()))s "
+                        + "[\(activeProfile.name)]"
+                )
+                return
             }
-            return
+            // Cold not yet confirmed — hold at minimum, like the hysteresis band.
         }
 
-        // Sustained trigger: per-profile duration.
-        // Converted to tick count at runtime based on tick interval.
-        // Always-on profiles skip it — they engage at any temperature.
-        let sustainedTicksNeeded = Int(curve.sustainedTriggerSec / tickInterval)
-        if !curve.alwaysOn && !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
-            if sustainedAboveCount == 1 {
-                TFLogger.shared.fan("Sustained trigger: \(String(format: "%.1f", peakTemp))°C — waiting (\(sustainedAboveCount)/\(sustainedTicksNeeded)) [\(activeProfile.name)]")
-            }
-            return
-        }
-
-        // 0.001 signals "keep at minimum" (hysteresis band)
+        // 0.001 signals "keep at minimum" (hysteresis band + unconfirmed cold)
+        let rawTarget = curveTarget ?? 0.001
         var targetPct = rawTarget <= 0.001 ? minRPM / maxRPM : rawTarget
 
         // Clamp to valid range

@@ -54,21 +54,21 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 ## Profiles
 
-Balanced and Performance use proportional curves with per-profile curve shapes — fans ramp gradually with temperature, not as binary switches. Max is the exception: fans pinned at 100% with no temperature conditions. The temperature-gated profiles share a unified 50°C off threshold (matching Apple's observed behavior) and each has its own sustained trigger duration — fans only engage after temperature stays above the start threshold for a profile-specific number of seconds, filtering transient spikes that resolve on their own. Reacting to transient spikes would cause the start/stop cycling that is the #1 cause of fan bearing wear (source: [Analog Devices fan control](https://www.analog.com/en/analog-dialogue/articles/how-to-control-fan-speed.html)).
+Balanced and Performance use proportional curves with per-profile curve shapes — fans ramp gradually with temperature, not as binary switches. Max is the exception: fans pinned at 100% with no temperature conditions. The temperature-gated profiles share a unified 50°C off threshold (matching Apple's observed behavior). There is no timed engage trigger: transient spikes are absorbed by the 5°C hysteresis band and the ramp governors — a brief blip above start only nudges the fans up at the profile's per-second rate, and the slower ramp-down rate walks them back, avoiding the start/stop cycling that is the #1 cause of fan bearing wear (source: [Analog Devices fan control](https://www.analog.com/en/analog-dialogue/articles/how-to-control-fan-speed.html)). Turning fans off is likewise confirmed, not instant: the peak sensor is a max over all CPU/GPU cores, and an idle core's reading drops 20–30°C the moment its workload ends, so a momentary dip below 50°C holds fans at minimum instead of stopping them — Apple auto mode resumes only after 5 seconds of sustained cold. Switching profiles takes effect on the next 100ms tick: Silent hands fans back to Apple immediately; Balanced, Performance and Max compute their target from the current temperature and ramp to it at their own rates.
 
 Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for smooth fan transitions. Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
 
-| Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
-|---|---|---|---|---|---|---|---|
-| **Silent (Apple Default)** | N/A | N/A | N/A | Apple | N/A | N/A | Monitoring only. Apple controls fans. |
-| **Balanced** | 50°C | 55°C | 70°C | 60% | Ease-in (pos²) | 8 seconds | Quiet at low temps, ramps harder as heat builds. |
-| **Performance** | 50°C | 55°C | 65°C | 85% | Linear | 4 seconds | Direct proportional response, 2× ramp-up speed. |
-| **Max** | N/A | N/A | N/A | 100% | Always on | N/A | Fans pinned at 100% until you switch profiles or press Default. |
+| Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Behavior |
+|---|---|---|---|---|---|---|
+| **Silent (Apple Default)** | N/A | N/A | N/A | Apple | N/A | Monitoring only. Apple controls fans. |
+| **Balanced** | 50°C | 55°C | 70°C | 60% | Ease-in (pos²) | Quiet at low temps, ramps harder as heat builds. |
+| **Performance** | 50°C | 55°C | 65°C | 85% | Linear | Direct proportional response, 2× ramp-up speed. |
+| **Max** | N/A | N/A | N/A | 100% | Always on | Fans pinned at 100% until you switch profiles or press Default. |
 
 **How profiles work:**
-- **Below 50°C:** All fans off. Machine is at idle. (Does not apply to Max.)
+- **At/below 50°C (sustained):** Fans hold at minimum while cold persists; after 5 seconds at/below 50°C they hand back to Apple auto mode (the machine is idle — Apple stops them). A momentary dip never stops the fans. (Does not apply to Max.)
 - **50°C–start (hysteresis zone):** Fans maintain current state. Already running → stay at minimum. Already off → stay off. (Does not apply to Max.)
-- **Above start for N seconds:** Fans engage. Balanced and Performance ramp proportionally using their curve shape.
+- **Above start:** Fans engage immediately. Balanced and Performance ramp proportionally using their curve shape.
 - **Max:** No temperature conditions — fans pin at 100% immediately (within one 100ms tick) and stay there until you switch profiles or press Default.
 - **Between start and ceiling:** Fan speed scales based on the profile's curve shape. Balanced (ease-in) is quiet at low temps — at 62.5°C (midpoint of 55–70°C), fans run at only 15% of max RPM instead of 30% linear. Performance (linear) is proportional.
 - **At ceiling and above:** Fan speed at the profile's maximum (60%/85%).
@@ -255,7 +255,7 @@ Each session produces a self-contained folder:
 
 ThermalForge has three types of stored data, all automatically managed:
 
-**App log** (daily files in `~/Library/Logs/ThermalForge/`) — one file per day (`thermalforge-2026-04-05.log`). Records all app events: profile changes, fan commands, temperature spikes, safety overrides, sustained trigger events. Auto-deletes files older than 7 days on app launch. Each daily file is small and easy to open or share.
+**App log** (daily files in `~/Library/Logs/ThermalForge/`) — one file per day (`thermalforge-2026-04-05.log`). Records all app events: profile changes, fan commands, temperature spikes, safety overrides, fans-off releases. Auto-deletes files older than 7 days on app launch. Each daily file is small and easy to open or share.
 
 **Research session logs** (`thermalforge log` exports in `~/Library/Application Support/ThermalForge/logs/`) — CSV/JSON research data. Auto-delete after 24 hours by default. Use `--no-expire` to keep permanently.
 
