@@ -5,11 +5,18 @@
 //  Menu bar app for fan control on Apple Silicon MacBooks.
 //
 
+import Darwin
 import SwiftUI
 import ThermalForgeCore
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // R4: the app can have its helper exit out from under an in-flight socket
+        // write (a `.restart`). Without this, that closed peer raises SIGPIPE and
+        // kills the app. Set process-wide before any daemon socket work; the
+        // per-fd SO_NOSIGPIPE in DaemonClient is the belt-and-braces guarantee.
+        signal(SIGPIPE, SIG_IGN)
+
         // No Dock icon — menu bar only
         NSApp.setActivationPolicy(.accessory)
 

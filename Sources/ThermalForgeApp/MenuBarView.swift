@@ -26,34 +26,52 @@ struct MenuBarView: View {
 
             Divider()
 
-            if appState.daemonUnreachable {
-                // Daemon not answering — nothing in the app can touch the fans, so
-                // this takes over the top of the menu and offers a one-click fix.
-                // The version/hold banners are moot while it's unreachable.
-                DaemonDownBanner(onRestart: { appState.restartDaemon() })
+            // Helper registration takes top priority: until the privileged helper
+            // is registered and approved, nothing can control the fans. The
+            // transient checking/registering states need no banner (the system
+            // auth prompt is visible on its own).
+            switch appState.helperRegistration {
+            case .requiresApproval, .failed:
+                HelperRegistrationBanner(
+                    status: appState.helperRegistration,
+                    onOpenSettings: { appState.openLoginItemsSettings() },
+                    onRetry: { appState.retryHelperRegistration() }
+                )
                 Divider()
-            } else {
-                // Update-needed banner — shown whenever the daemon is out of sync.
-                // Persistent (no dismiss): a stale daemon should keep nagging.
-                if let daemonVersion = appState.daemonVersionMismatch {
-                    DaemonUpdateBanner(daemonVersion: daemonVersion)
+            default:
+                if appState.daemonUnreachable {
+                    // Daemon not answering — nothing in the app can touch the fans,
+                    // so this takes over the top of the menu and offers a one-click
+                    // fix. The version/hold banners are moot while it's unreachable.
+                    DaemonDownBanner(onRestart: { appState.restartDaemon() })
                     Divider()
-                }
+                } else {
+                    // Update-needed banner — shown whenever the daemon is out of
+                    // sync. Persistent (no dismiss): a stale daemon keeps nagging.
+                    if let daemonVersion = appState.daemonVersionMismatch {
+                        DaemonUpdateBanner(
+                            daemonVersion: daemonVersion,
+                            recoveryInProgress: appState.daemonRecoveryInProgress,
+                            onRetry: { appState.retryDaemonRecovery() }
+                        )
+                        Divider()
+                    }
 
-                // CLI-hold banner — the app is reflecting a hold set from the
-                // terminal and won't adjust fans until the user takes over. The
-                // Default button (or picking a profile) releases it.
-                if let hold = appState.externalHold {
-                    ExternalHoldBanner(hold: hold)
-                    Divider()
-                }
+                    // CLI-hold banner — the app is reflecting a hold set from the
+                    // terminal and won't adjust fans until the user takes over. The
+                    // Default button (or picking a profile) releases it.
+                    if let hold = appState.externalHold {
+                        ExternalHoldBanner(hold: hold)
+                        Divider()
+                    }
 
-                // Update-available banner — informational, lowest priority. Suppressed
-                // while "Update needed" (daemon out of sync) shows, so two update-ish
-                // banners never stack; can coexist with a CLI hold.
-                if appState.daemonVersionMismatch == nil, let update = appState.availableUpdate {
-                    UpdateAvailableBanner(update: update, onDismiss: { appState.dismissUpdate() })
-                    Divider()
+                    // Update-available banner — informational, lowest priority.
+                    // Suppressed while "Update needed" (daemon out of sync) shows, so
+                    // two update-ish banners never stack; coexists with a CLI hold.
+                    if appState.daemonVersionMismatch == nil, let update = appState.availableUpdate {
+                        UpdateAvailableBanner(update: update, onDismiss: { appState.dismissUpdate() })
+                        Divider()
+                    }
                 }
             }
 
@@ -241,47 +259,124 @@ private struct ExternalHoldBanner: View {
     }
 }
 
-/// Non-modal in-menu banner telling the user the background daemon is out of
-/// sync and exactly how to fix it. Command is selectable so it can be copied.
+/// Non-modal in-menu banner telling the user the background helper is out of
+/// sync. The app fixes this itself (restart → re-register); this only reports
+/// progress and, on failure, offers the retry — never a Terminal command.
 private struct DaemonUpdateBanner: View {
     let daemonVersion: String
+    let recoveryInProgress: Bool
+    let onRetry: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("Update needed", systemImage: "exclamationmark.triangle.fill")
+            Label(recoveryInProgress ? "Updating background service" : "Background service update failed",
+                  systemImage: recoveryInProgress ? "arrow.triangle.2.circlepath" : "exclamationmark.triangle.fill")
                 .font(.caption.bold())
-                .foregroundStyle(.orange)
+                .foregroundStyle(recoveryInProgress ? .blue : .orange)
 
-            Text("The background service is running \(daemonVersion), but the app is \(ThermalForgeVersion.current). Fan control may not match what you set until they're re-synced.")
+            Text("The background service is running \(daemonVersion), but the app is \(ThermalForgeVersion.current).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("Run this in Terminal:")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            if recoveryInProgress {
+                Text("ThermalForge is restarting the background service and re-syncing it automatically. Fan control returns when it finishes.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Automatic recovery couldn't update it. Try again — macOS may ask you to approve the helper.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button(action: onRetry) {
+                    Label("Try again", systemImage: "arrow.clockwise")
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
                 .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background((recoveryInProgress ? Color.blue : Color.orange).opacity(0.12))
+    }
+}
+
+/// Shown when the embedded privileged helper still needs user approval in
+/// System Settings (or registration/approval failed). Until it's approved the
+/// app cannot control fans, so this sits at the top of the menu.
+private struct HelperRegistrationBanner: View {
+    let status: AppState.HelperRegistrationStatus
+    let onOpenSettings: () -> Void
+    let onRetry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(title, systemImage: "lock.shield.fill")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("sudo thermalforge install")
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
+            Button(action: onOpenSettings) {
+                Label("Open Login Items Settings", systemImage: "gearshape")
+                    .font(.caption.bold())
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .padding(.top, 2)
+
+            HStack {
+                Text("After you approve it, this updates on its own.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 2)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange.opacity(0.12))
     }
+
+    private var title: String {
+        switch status {
+        case .requiresApproval: return "Approve background helper"
+        case .failed: return "Background helper unavailable"
+        default: return "Setting up background helper"
+        }
+    }
+
+    private var message: String {
+        switch status {
+        case .requiresApproval:
+            return "macOS needs your approval before ThermalForge can control fans. Enable ThermalForge under Login Items & Extensions."
+        case .failed(let reason):
+            return "ThermalForge couldn't register its background helper, so fan control is unavailable. \(reason)"
+        default:
+            return "Setting up the background service…"
+        }
+    }
 }
 
 /// Shown when a newer ThermalForge release exists than the installed build. Purely
 /// informational (blue, not the orange "Update needed"): it tells the user an update
-/// shipped and how to get it — the app can't run `brew upgrade` for them. Dismissible
-/// per-version via "Later".
+/// shipped and how to get it — replacing the app bundle brings the embedded helper
+/// with it. Dismissible per-version via "Later".
 private struct UpdateAvailableBanner: View {
     let update: AvailableUpdate
     let onDismiss: () -> Void
@@ -297,21 +392,13 @@ private struct UpdateAvailableBanner: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("Update with:")
+            Text("Download the new ThermalForge.app and replace the one in Applications — the embedded helper updates with it.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .padding(.top, 2)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("brew upgrade thermalforge && sudo thermalforge install")
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
-
-            Text("Built from source? Run  git pull && ./setup.sh")
+            Text("Built from source? Rebuild and run  ./setup.sh")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)

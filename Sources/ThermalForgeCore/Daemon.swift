@@ -122,6 +122,17 @@ public final class DaemonClient {
         return state
     }
 
+    /// Ask the helper to exit so launchd (KeepAlive) respawns the freshly
+    /// installed bundle binary. Mirrors `readState()`: one typed request, throws
+    /// on transport failure, returns the decoded response. The daemon
+    /// acknowledges with a plain `ok`; a daemon built before the `.restart` verb
+    /// answers `.unsupportedVersion` (ok == false) rather than throwing, so the
+    /// caller can fall back.
+    @discardableResult
+    public func restart() throws -> DaemonResponse {
+        try request(DaemonRequest(verb: .restart))
+    }
+
     /// Apply a `FanCommand`, throwing `commandFailed` on an error response.
     /// - oneshot: apply the command but do NOT arm the heartbeat watchdog — for
     ///   fire-and-forget CLI holds that must persist without a supervising process.

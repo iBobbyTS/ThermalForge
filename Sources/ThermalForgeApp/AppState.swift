@@ -11,6 +11,17 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
+    /// Lifecycle of the embedded privileged helper's SMAppService registration.
+    /// Drives the registration banner; `ready` is the ordering gate that lets
+    /// daemon adoption and the heartbeat start.
+    enum HelperRegistrationStatus: Equatable {
+        case checking
+        case registering
+        case requiresApproval
+        case failed(String)
+        case ready
+    }
+
     @Published var latestStatus: ThermalStatus?
     @Published var activeProfile: FanProfile = .silent
     @Published var monitorState: MonitorState = .idle
@@ -26,12 +37,19 @@ final class AppState: ObservableObject {
     @Published var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled) {
         didSet { updateLoginItem() }
     }
-    /// The running daemon's version when it differs from this app's build, else
-    /// nil. Non-nil drives the "update needed" banner and menu bar badge — the
-    /// long-lived daemon keeps running the old binary after a `brew upgrade`
-    /// until `sudo thermalforge install` re-syncs it.
+    /// The running helper's version when it differs from this app's build, else
+    /// nil. Non-nil drives the "update needed" banner and menu bar badge. The
+    /// app self-heals on mismatch (restart the helper → poll → re-register if
+    /// needed); this stays non-nil only while recovery is running or after it
+    /// has exhausted its automatic attempts.
     @Published var daemonVersionMismatch: String?
-    /// A hold set from the CLI (`sudo thermalforge max`) that the app is
+    /// True while the automatic version-mismatch recovery is running; the update
+    /// banner shows progress and hides the manual retry until it settles.
+    @Published private(set) var daemonRecoveryInProgress: Bool = false
+    /// SMAppService registration state for the embedded helper. Starts `checking`
+    /// and only reaches `ready` after the system has approved the daemon.
+    @Published private(set) var helperRegistration: HelperRegistrationStatus = .checking
+    /// A hold set from the CLI (`thermalforge max`) that the app is
     /// reflecting rather than fighting. Non-nil suspends the app's automatic
     /// profile control and drives the "held from Terminal" banner; the user
     /// takes back over by picking a profile or pressing Default.
@@ -52,6 +70,25 @@ final class AppState: ObservableObject {
     private var heartbeatTimer: DispatchSourceTimer?
     /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
     private var heartbeatFailures = 0
+
+    /// Serial queue for the SMAppService registration calls, which can block on
+    /// the system admin-authorization dialog. Never the main thread.
+    private let registrationQueue = DispatchQueue(label: "com.thermalforge.registration", qos: .userInitiated)
+    /// Polls SMAppService status while a registration waits on user approval.
+    private var registrationPollTimer: DispatchSourceTimer?
+    /// Set once adopt + heartbeat have been released through the registration
+    /// gate; keeps a later re-registration from adopting/running them twice.
+    private var adoptionStarted = false
+    /// True once automatic version recovery has exhausted its attempts, so the
+    /// heartbeat doesn't retry it on every 5s tick. Cleared by the banner retry.
+    private var daemonRecoveryExhausted = false
+
+    /// The embedded launch daemon's SMAppService handle. `nonisolated` so the
+    /// registration queue can read status / register off the main actor; it
+    /// touches no instance state.
+    nonisolated private var daemonService: SMAppService {
+        SMAppService.daemon(plistName: DaemonBundlePlist.filename)
+    }
 
     /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
     /// or hung daemon can never stall the UI run loop (the v0.1.7 freeze).
@@ -92,17 +129,148 @@ final class AppState: ObservableObject {
         // Show a previously-found update immediately, before any network call.
         availableUpdate = Self.storedAvailableUpdate()
 
-        adoptDaemonStateOnLaunch()
+        // Registration (or re-adoption) of the embedded privileged helper comes
+        // FIRST. register() can block on the system admin-authorization dialog,
+        // so it runs on registrationQueue and only calls back on `.ready`; adopt
+        // and heartbeat are gated on that (the ordering gate below). Fan/temp
+        // reads are unprivileged and must keep working regardless, so start
+        // monitoring unconditionally and never wait on registration for it.
+        beginHelperRegistration()
 
         // Clean expired logs
         ThermalLogger.cleanExpired()
 
         startMonitoring()
-        // startHeartbeat() is intentionally NOT called here — it is launched from
-        // adoptDaemonStateOnLaunch()'s @MainActor completion (the ordering gate),
-        // so the first heartbeat poll can never land before adopt has applied the
-        // launch state. The original synchronous adopt gave this ordering for free;
-        // the async version must restore it explicitly.
+        // adoptDaemonStateOnLaunch() is now released from finishHelperRegistration()
+        // (on `.ready`), and startHeartbeat() from adopt's completion — so neither
+        // can run before the helper is registered and approved. The original
+        // synchronous adopt gave this ordering for free; the async version must
+        // restore it explicitly.
+    }
+
+    // MARK: - Helper registration (SMAppService)
+
+    /// Start (or restart) the registration state machine. Safe to call again for
+    /// runtime revocation: it re-reads status and re-enters the appropriate
+    /// branch. Never blocks the main thread — `register()` may wait on the system
+    /// auth prompt, so it runs on `registrationQueue`.
+    func beginHelperRegistration() {
+        registrationPollTimer?.cancel()
+        registrationPollTimer = nil
+        helperRegistration = .checking
+        registrationQueue.async { [weak self] in
+            self?.performRegistrationFlow()
+        }
+    }
+
+    /// Retry from the registration banner after a failure/denial.
+    func retryHelperRegistration() {
+        beginHelperRegistration()
+    }
+
+    /// Runs OFF the main thread. Reads the helper's SMAppService status and
+    /// registers once when it isn't registered yet; every branch hops back to
+    /// the main actor to update published state.
+    nonisolated private func performRegistrationFlow() {
+        let service = SMAppService.daemon(plistName: DaemonBundlePlist.filename)
+        switch service.status {
+        case .enabled:
+            Task { @MainActor [weak self] in self?.finishHelperRegistration() }
+        case .requiresApproval:
+            // A prior registration is still pending the user's approval — don't
+            // re-register; surface the banner and poll.
+            Task { @MainActor [weak self] in self?.enterHelperApproval() }
+        default:
+            // .notRegistered → register for the first time. `.notFound` (macOS
+            // 15+) or any future status means the helper isn't usable yet, so
+            // the same register attempt (and its banner on failure) applies.
+            Task { @MainActor [weak self] in self?.helperRegistration = .registering }
+            do {
+                try service.register()
+                switch service.status {
+                case .enabled:
+                    Task { @MainActor [weak self] in self?.finishHelperRegistration() }
+                case .requiresApproval:
+                    Task { @MainActor [weak self] in self?.enterHelperApproval() }
+                default:
+                    Task { @MainActor [weak self] in
+                        self?.helperRegistration = .failed("The helper was registered but the system hasn't enabled it yet. Approve it in System Settings, then retry.")
+                    }
+                }
+            } catch {
+                let message = error.localizedDescription
+                Task { @MainActor [weak self] in
+                    self?.helperRegistration = .failed(message)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func enterHelperApproval() {
+        helperRegistration = .requiresApproval
+        startRegistrationPolling()
+    }
+
+    @MainActor
+    private func finishHelperRegistration() {
+        registrationPollTimer?.cancel()
+        registrationPollTimer = nil
+        helperRegistration = .ready
+        proceedIfRegistrationReady()
+    }
+
+    /// The ordering gate: adopt the daemon's launch state (and, via its
+    /// completion, start the heartbeat) only once, and only after registration
+    /// is `.ready`. A later re-registration after revocation leaves the already
+    /// running heartbeat in place — it recovers on its own once the daemon is
+    /// back — so adoption must not run twice.
+    @MainActor
+    private func proceedIfRegistrationReady() {
+        guard !adoptionStarted, helperRegistration == .ready else { return }
+        adoptionStarted = true
+        adoptDaemonStateOnLaunch()
+    }
+
+    /// Poll SMAppService while approval is pending; the status flips to
+    /// `.enabled` once the user approves in System Settings. Two seconds is
+    /// responsive without meaningfully touching the system each tick.
+    @MainActor
+    private func startRegistrationPolling() {
+        registrationPollTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: registrationQueue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let status = SMAppService.daemon(plistName: DaemonBundlePlist.filename).status
+            switch status {
+            case .enabled:
+                Task { @MainActor [weak self] in self?.finishHelperRegistration() }
+            case .requiresApproval:
+                break   // still waiting on the user — keep polling
+            default:
+                // Approval was denied / registration was removed while waiting.
+                Task { @MainActor [weak self] in
+                    self?.registrationPollingLost()
+                }
+            }
+        }
+        timer.resume()
+        registrationPollTimer = timer
+    }
+
+    @MainActor
+    private func registrationPollingLost() {
+        registrationPollTimer?.cancel()
+        registrationPollTimer = nil
+        helperRegistration = .failed("Background helper approval wasn't granted. Approve ThermalForge in System Settings, then retry.")
+    }
+
+    /// Open System Settings to the Login Items & Extensions pane, where the user
+    /// approves the pending helper. The polling above notices the approval.
+    @MainActor
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
     }
 
     /// Sync to whatever the daemon is actually holding at launch instead of
@@ -192,6 +360,12 @@ final class AppState: ObservableObject {
             // Runs OFF the main thread. Each socket round-trip is bounded by the
             // request timeout, so a hung daemon can no longer stall the UI.
 
+            // During a version-mismatch recovery the helper is deliberately being
+            // restarted / re-registered. Skip this tick entirely so the two-miss
+            // `daemonUnreachable` debounce can't flap over an intended restart,
+            // and so the recovery owns the polling window.
+            if daemonRecoveryWindow.isActive { return }
+
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
             // liveness and the daemon watchdog reverts after 15s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
@@ -238,6 +412,14 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
                 if didReadState { self.externalHold = holdValue }
+                // A definitive version read that disagrees with this build is the
+                // mismatch signal: start (or continue) automatic recovery. The
+                // recovery is idempotent — a concurrent run and an exhausted run
+                // both short-circuit — and it suppresses further heartbeat ticks
+                // while it owns the restart window.
+                if didReadVersion, versionValue != nil {
+                    self.beginDaemonRecovery()
+                }
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
@@ -246,7 +428,15 @@ final class AppState: ObservableObject {
                     self.daemonUnreachable = false
                 } else {
                     self.heartbeatFailures += 1
-                    if self.heartbeatFailures >= 2 { self.daemonUnreachable = true }
+                    if self.heartbeatFailures >= 2 {
+                        let becameUnreachable = !self.daemonUnreachable
+                        self.daemonUnreachable = true
+                        // The socket can go quiet because the helper's SMAppService
+                        // registration was revoked (or is pending approval), not
+                        // because of a crash. In that case a launchd kickstart can't
+                        // help — re-enter the registration state machine instead.
+                        if becameUnreachable { self.checkRegistrationWhileUnreachable() }
+                    }
                 }
             }
 
@@ -454,6 +644,123 @@ final class AppState: ObservableObject {
 
     // MARK: - Daemon recovery
 
+    /// Called when the heartbeat first goes unreachable. If the helper is no
+    /// longer enabled in SMAppService (revoked in System Settings, or a pending
+    /// registration that was never approved) a kickstart cannot help — re-enter
+    /// the registration state machine so the banner guides the real fix. When
+    /// the registration is still `.enabled` this is a genuine outage and the
+    /// existing down banner / kickstart remains the recovery.
+    @MainActor
+    private func checkRegistrationWhileUnreachable() {
+        switch daemonService.status {
+        case .enabled:
+            break
+        default:
+            TFLogger.shared.info("Helper unreachable and not enabled in SMAppService — re-entering registration")
+            beginHelperRegistration()
+        }
+    }
+
+    /// Automatic recovery from a helper version mismatch: restart the helper so
+    /// launchd respawns the freshly-installed bundle binary, tolerate the down
+    /// window while probing for the app's version, and — only if the restart
+    /// didn't take — re-register the daemon from the current bundle. Runs OFF the
+    /// main thread; the completion hops back to apply the outcome.
+    @MainActor
+    private func beginDaemonRecovery() {
+        guard !daemonRecoveryExhausted else { return }
+        guard daemonRecoveryWindow.begin() else { return }   // already recovering
+        daemonRecoveryInProgress = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let outcome = AppState.runDaemonRecovery()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                daemonRecoveryWindow.end()
+                self.daemonRecoveryInProgress = false
+                switch outcome {
+                case .recovered:
+                    self.daemonVersionMismatch = nil
+                    self.daemonRecoveryExhausted = false
+                    self.heartbeatFailures = 0
+                    self.daemonUnreachable = false
+                    // The helper exited through resetAuto, so the fans are back in
+                    // Apple auto and the monitor's tracked runtime state is stale.
+                    // Forget it so the next tick re-seeds from the observed RPM and
+                    // re-writes / re-holds naturally (bumpless takeover).
+                    self.monitor?.resetFanState()
+                    TFLogger.shared.info("Helper version recovered — monitor reseeded from observed RPM")
+                case .failed(let version):
+                    self.daemonVersionMismatch = version
+                    self.daemonRecoveryExhausted = true
+                    TFLogger.shared.error("Helper version recovery failed — helper reports \(version)")
+                }
+            }
+        }
+    }
+
+    /// Re-run the recovery on demand (the mismatch banner's retry action), after
+    /// the automatic attempts have been exhausted.
+    func retryDaemonRecovery() {
+        daemonRecoveryExhausted = false
+        beginDaemonRecovery()
+    }
+
+    private enum DaemonRecoveryOutcome {
+        case recovered
+        case failed(version: String)
+    }
+
+    /// The blocking recovery sequence, run off-main: (1) `.restart` the helper;
+    /// (2) probe the version over a ~10s window for the respawn; (3) if it still
+    /// disagrees, unregister + re-register the daemon (which may present the
+    /// system authorization prompt) and re-probe; (4) report the final state.
+    /// `nonisolated` so it runs entirely off the main actor.
+    nonisolated private static func runDaemonRecovery() -> DaemonRecoveryOutcome {
+        let client = DaemonClient()
+
+        // (1) Ask the helper to exit; launchd's KeepAlive respawns the bundle
+        // binary. A daemon too old to know `.restart` answers unsupported (ok ==
+        // false) rather than throwing — proceed to the same polling either way.
+        _ = try? client.restart()
+
+        // (2) Tolerate the unreachable window. Eight probes spaced a second apart
+        // cover ~10s; each bounded connect/read failure costs up to the client
+        // timeout, so the real ceiling is a little higher — deliberately generous
+        // so a slow respawn isn't mistaken for a failed recovery.
+        if probeVersion(client) == ThermalForgeVersion.current {
+            return .recovered
+        }
+
+        // (3) A respawn from the existing registration still reports the old
+        // build — the registered bundle/plist is stale. Re-register from the
+        // current bundle (this can show the system authorization prompt again).
+        let service = SMAppService.daemon(plistName: DaemonBundlePlist.filename)
+        try? service.unregister()
+        try? service.register()
+        if probeVersion(client) == ThermalForgeVersion.current {
+            return .recovered
+        }
+
+        // (4) Still wrong after restart + re-registration: report the helper's
+        // own last-seen build so the banner is accurate.
+        let last = (try? client.request(DaemonRequest(verb: .version)))?.version
+        return .failed(version: last ?? "an older build")
+    }
+
+    /// Poll the daemon's reported version until it matches this build or the
+    /// probe window is exhausted. Returns nil if the daemon never answered.
+    nonisolated private static func probeVersion(_ client: DaemonClient) -> String? {
+        var last: String?
+        for attempt in 0..<8 {
+            if attempt > 0 { Thread.sleep(forTimeInterval: 1.0) }
+            if let v = (try? client.request(DaemonRequest(verb: .version)))?.version {
+                last = v
+                if v == ThermalForgeVersion.current { return v }
+            }
+        }
+        return last
+    }
+
     /// Force the root daemon to restart via launchd, from the "Restart daemon"
     /// button on the unreachable banner. Runs OFF the main thread (it blocks on the
     /// macOS auth dialog). Uses `launchctl kickstart -k` — the standard "restart
@@ -499,3 +806,35 @@ final class AppState: ObservableObject {
         }
     }
 }
+
+// MARK: - Recovery window flag
+
+/// Lock-guarded flag shared across isolation domains: the version-mismatch
+/// recovery (started on the main actor) sets it while it owns a helper restart,
+/// and the heartbeat (off-main) reads it to skip its reachability debounce
+/// during that deliberate down window. A plain stored property can't be shared
+/// across the @MainActor boundary, hence the lock box.
+private final class DaemonRecoveryWindow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = false
+
+    var isActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return active
+    }
+
+    /// Claim the window; returns false when one is already in progress.
+    func begin() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if active { return false }
+        active = true
+        return true
+    }
+
+    func end() {
+        lock.lock(); active = false; lock.unlock()
+    }
+}
+
+/// Single process-wide recovery window — AppState is a singleton in the app.
+private let daemonRecoveryWindow = DaemonRecoveryWindow()
