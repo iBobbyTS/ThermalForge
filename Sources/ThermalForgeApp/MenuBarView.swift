@@ -285,7 +285,7 @@ private struct DaemonUpdateBanner: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Automatic recovery couldn't update it. Try again — macOS may ask you to approve the helper.")
+                Text("Automatic recovery couldn't update it. Try again — macOS may ask you to approve the helper. If it still fails: System Settings → General → Login Items & Extensions → turn the ThermalForge item off, then on again.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -74,6 +74,9 @@ final class AppState: ObservableObject {
     /// Rate-limits it to one per `lossReengageInterval` so a re-engage whose own
     /// write keeps failing can't thrash the monitor on every 5s beat.
     private var lastLossReengage = Date.distantPast
+    /// Last time the unreachable-with-status-enabled path ran a verified
+    /// re-register cycle (stale-launch-constraint healing after an update).
+    private var lastDownRegistrationCycle = Date.distantPast
     /// Minimum spacing between hold-lost re-engages (see `lastLossReengage`).
     private static let lossReengageInterval: TimeInterval = 30
 
@@ -728,7 +731,16 @@ final class AppState: ObservableObject {
     private func checkRegistrationWhileUnreachable() {
         switch daemonService.status {
         case .enabled:
-            break
+            // BTM claims enabled yet nothing serves — after an ad-hoc-signed app
+            // update the helper's respawn is blocked by a stale launch constraint
+            // record while status still reads .enabled (observed live). A bare
+            // kickstart cannot refresh constraints; the verified re-register
+            // cycle can. Rate-limited; the down banner stays as the manual path.
+            if Date().timeIntervalSince(lastDownRegistrationCycle) >= 30 {
+                lastDownRegistrationCycle = Date()
+                TFLogger.shared.info("Helper unreachable while SMAppService reads .enabled — running verified re-register cycle")
+                beginDaemonRecovery()
+            }
         default:
             TFLogger.shared.info("Helper unreachable and not enabled in SMAppService — re-entering registration")
             beginHelperRegistration()
@@ -828,18 +840,51 @@ final class AppState: ObservableObject {
 
         // (3) A respawn from the existing registration still reports the old
         // build — the registered bundle/plist is stale. Re-register from the
-        // current bundle (this can show the system authorization prompt again).
+        // current bundle. This MUST be a settled, verified cycle: a back-to-back
+        // unregister→register races BTM's teardown and can leave the launch
+        // constraint record pinned to the OLD binary's signature — the respawn
+        // then dies to OS_REASON_CODESIGNING while status still reads .enabled
+        // (observed live on an ad-hoc-signed update). Two attempts, 3s apart.
         let service = SMAppService.daemon(plistName: DaemonBundlePlist.filename)
-        try? service.unregister()
-        try? service.register()
-        if probeVersion(client) == ThermalForgeVersion.current {
-            return .recovered
+        for cycle in 0..<2 {
+            if cycle > 0 { Thread.sleep(forTimeInterval: 3.0) }
+            if reregisterVerified(service, client) {
+                return .recovered
+            }
         }
 
         // (4) Still wrong after restart + re-registration: report the helper's
         // own last-seen build so the banner is accurate.
         let last = (try? client.request(DaemonRequest(verb: .version)))?.version
         return .failed(version: last ?? "an older build")
+    }
+
+    /// One clean unregister → settle → register → serve-verify cycle. True only
+    /// when the helper actually answers over the socket with THIS build's
+    /// version — `SMAppService.status` alone reported .enabled while the helper
+    /// was being killed by a stale launch constraint, so status cannot be the
+    /// success signal here.
+    nonisolated private static func reregisterVerified(_ service: SMAppService, _ client: DaemonClient) -> Bool {
+        try? service.unregister()
+
+        // Settle: wait for the teardown to actually complete (≤5s). Registering
+        // while the old item is still being removed re-attaches its stale launch
+        // constraint instead of deriving a fresh one for the current binary.
+        for _ in 0..<5 {
+            if service.status == .notRegistered { break }
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+
+        do {
+            try service.register()
+        } catch {
+            TFLogger.shared.error("Helper re-registration failed: \(error.localizedDescription)")
+            return false
+        }
+
+        // Verify by SERVICE, not status: the respawn after a constraint refresh
+        // can take a few seconds to appear on the socket.
+        return probeVersion(client) == ThermalForgeVersion.current
     }
 
     /// Poll the daemon's reported version until it matches this build or the
