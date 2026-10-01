@@ -337,8 +337,18 @@ public final class ThermalMonitor {
                 // resetAuto is a real control action (fans handed to the system),
                 // so a pending forced re-take is satisfied here.
                 forceNextWrite = false
+            } else if forceNextWrite {
+                // Forced re-engage reconciliation for the hands-off case. A helper
+                // recovery can arm forceReengage (reengageAfterHelperRecovery does
+                // not gate on the profile) while the active profile is hands-off —
+                // Silent is the default and the restored choice — and the hardware
+                // may still be manual from before the crash. Hands-off never writes
+                // a hold of its own, so nothing would otherwise revert it: hand it
+                // back to Apple auto now (a real control action, satisfying the
+                // one-shot). Without the flag there is nothing to reconcile.
+                applyCommand(.resetAuto)
+                forceNextWrite = false
             }
-            // Not running → nothing to write: keep forceNextWrite armed.
             return
         }
 
@@ -357,8 +367,20 @@ public final class ThermalMonitor {
             // and over (2,182 releases in three days of logs — the sudden
             // 3000+→1300 RPM drops). Until cold is sustained, hold at minimum —
             // the same treatment the hysteresis band gives.
-            // Not running → nothing to write: keep forceNextWrite armed.
-            guard fansCurrentlyRunning else { return }
+            guard fansCurrentlyRunning else {
+                // Forced re-engage reconciliation. A helper crash can leave the
+                // hardware in manual mode while forceReengage set
+                // fansCurrentlyRunning=false; if this tick is below stop temp there
+                // is no curve target and thus no supervising write coming, so the
+                // fans would stay manual forever. Hand them back to Apple auto now
+                // (a real control action, satisfying the one-shot). Without the flag
+                // there is nothing to reconcile: keep forceNextWrite armed.
+                if forceNextWrite {
+                    applyCommand(.resetAuto)
+                    forceNextWrite = false
+                }
+                return
+            }
             if offAction == .release {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false

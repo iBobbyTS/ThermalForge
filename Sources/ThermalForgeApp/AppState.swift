@@ -70,6 +70,22 @@ final class AppState: ObservableObject {
     private var heartbeatTimer: DispatchSourceTimer?
     /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
     private var heartbeatFailures = 0
+    /// Last time the heartbeat's hold-lost reconciliation fired a re-engage.
+    /// Rate-limits it to one per `lossReengageInterval` so a re-engage whose own
+    /// write keeps failing can't thrash the monitor on every 5s beat.
+    private var lastLossReengage = Date.distantPast
+    /// Minimum spacing between hold-lost re-engages (see `lastLossReengage`).
+    private static let lossReengageInterval: TimeInterval = 30
+
+    /// True when the monitor believes the app is actively holding a fan setting —
+    /// an `.active` curve profile or a `.safetyOverride`. `.idle` means it isn't,
+    /// so there is no hold to have been lost.
+    private static func isActivelyControlling(_ state: MonitorState) -> Bool {
+        switch state {
+        case .active, .safetyOverride: return true
+        case .idle: return false
+        }
+    }
 
     /// Serial queue for the SMAppService registration calls, which can block on
     /// the system admin-authorization dialog. Never the main thread.
@@ -409,10 +425,15 @@ final class AppState: ObservableObject {
             // as-is (don't clear a reflected CLI hold on a transient failure).
             let didReadState: Bool
             let holdValue: DaemonHoldState?
+            /// The daemon's raw state this beat (owner "none"/"cli"/"app"), needed
+            /// beyond the CLI-hold projection to detect a lost app hold below.
+            let daemonState: DaemonHoldState?
             if let hold = try? client.readState() {
+                daemonState = hold
                 holdValue = hold.isCLIHold ? hold : nil
                 didReadState = true
             } else {
+                daemonState = nil
                 holdValue = nil
                 didReadState = false
             }
@@ -458,6 +479,26 @@ final class AppState: ObservableObject {
                         // and the daemon's supervised hold died with the process.
                         // Rebuild control exactly as version recovery does.
                         self.reengageAfterHelperRecovery(reason: "respawned after crash")
+                    } else if didReadState, let daemon = daemonState,
+                              self.externalHold == nil,
+                              Self.isActivelyControlling(self.monitorState),
+                              daemon.owner != "app" {
+                        // Fast-respawn window: a KeepAlive respawn can complete
+                        // between two beats, before the two-miss debounce ever sets
+                        // `daemonUnreachable` — so `wasUnreachable` is false and yet
+                        // the new daemon holds no app hold. The heartbeat already
+                        // read the daemon state, so detect the loss directly: the app
+                        // believes it is controlling (monitorState active/safety) while
+                        // the daemon's owner is not "app" (it holds nothing, or holds
+                        // someone else's). NO CLI hold is reflected (externalHold nil),
+                        // so there is nothing to yield to. Rebuild the hold.
+                        // Rate-limited so a re-engage whose write keeps failing can't
+                        // fire every beat; a successful write makes owner == "app"
+                        // and naturally clears the condition.
+                        if Date().timeIntervalSince(self.lastLossReengage) >= Self.lossReengageInterval {
+                            self.lastLossReengage = Date()
+                            self.reengageAfterHelperRecovery(reason: "hold lost across respawn")
+                        }
                     }
                 } else {
                     self.heartbeatFailures += 1

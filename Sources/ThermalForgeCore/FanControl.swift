@@ -296,23 +296,36 @@ public final class FanControl {
     public func resetAuto() throws {
         let count = try fanCount()
 
+        // Attempt EVERY restoration write even if an earlier one fails, so one
+        // uncooperative key can't strand the remaining fans in manual mode. The
+        // failure is still reported — the daemon's `.restart` shutdown gates on a
+        // confirmed reset and must not proceed on a silent no-op — but only after
+        // all writes have been tried. Remember the first failing key for the error.
+        var firstFailedKey: String?
+
         for i in 0..<count {
             let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            guard smc.writeKey(modeKey, bytes: [0]) else {
-                throw ThermalForgeError.writeFailed(modeKey)
+            if !smc.writeKey(modeKey, bytes: [0]), firstFailedKey == nil {
+                firstFailedKey = modeKey
             }
+        }
 
+        for i in 0..<count {
             let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            guard smc.writeKey(targetKey, bytes: floatToSMCBytes(0)) else {
-                throw ThermalForgeError.writeFailed(targetKey)
+            if !smc.writeKey(targetKey, bytes: floatToSMCBytes(0)), firstFailedKey == nil {
+                firstFailedKey = targetKey
             }
         }
 
         // Reset Ftst if it exists — thermalmonitord reclaims control
         if hasFtst {
-            guard smc.writeKey(SMCFanKey.forceTest, bytes: [0]) else {
-                throw ThermalForgeError.writeFailed(SMCFanKey.forceTest)
+            if !smc.writeKey(SMCFanKey.forceTest, bytes: [0]), firstFailedKey == nil {
+                firstFailedKey = SMCFanKey.forceTest
             }
+        }
+
+        if let key = firstFailedKey {
+            throw ThermalForgeError.writeFailed(key)
         }
         log("Reset to Apple defaults")
     }
