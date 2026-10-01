@@ -55,19 +55,22 @@ public enum FanRouteError: Error, LocalizedError, CustomStringConvertible {
         switch self {
         case .rootRequired:
             return """
-                This fan command needs root, and no daemon is running to do it for you.
-                Run it with sudo, or install the background daemon:  sudo thermalforge install
+                This fan command needs root, and ThermalForge's embedded helper isn't \
+                running to do it for you.
+                Run it with sudo, or open /Applications/ThermalForge.app and approve its \
+                background helper (System Settings > General > Login Items & Extensions) \
+                so it can apply commands without sudo.
                 """
         case .perFanNeedsNewerDaemon(let version):
             return """
-                The background daemon (\(version)) is too old to set individual fans, so this needs \
-                a direct hardware write (root).
-                Run it with sudo, or re-sync the daemon:  sudo thermalforge install
+                The background helper (\(version)) is too old to set individual fans, so this \
+                needs a direct hardware write (root).
+                Run it with sudo, or reopen ThermalForge so it updates its embedded helper.
                 """
         case .legacyDaemonNeedsReinstall:
             return """
-                The background daemon is an older build that can't use the updated control protocol.
-                Finish the upgrade to reconnect it:  sudo thermalforge install
+                The background helper is an older build that can't use the updated control protocol.
+                Reopen ThermalForge to update its embedded helper; if it stays stale, run ./setup.sh from source.
                 """
         }
     }

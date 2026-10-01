@@ -31,7 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Reset fans on quit so the daemon doesn't hold stale APP settings — but
-        // ONLY if the app owns the hold. A CLI hold (`sudo thermalforge max`) is the
+        // ONLY if the app owns the hold. A CLI hold (`thermalforge max`) is the
         // user's deliberate, unsupervised choice; quitting the menu bar app must not
         // destroy it — that's the v0.1.7 arbitration feature. Synchronous on purpose:
         // the process is exiting, so an async write would be dropped; both calls are

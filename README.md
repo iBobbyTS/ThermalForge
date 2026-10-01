@@ -49,7 +49,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 - Safety override: fans go to maximum when a critical sensor *stays* above 95°C for 2 seconds while a manual hold is keeping them too low — a momentary single-core boost spike won't trigger it. Enforced in the daemon (works with the app closed) and mirrored in the app's monitor with a 5°C release hysteresis. In Silent (Apple Default) ThermalForge never seizes control at all: Apple's own thermal management is the safety there
 - Crash recovery: the daemon's heartbeat watchdog resets fans to Apple defaults if the app dies — and if a thermal safety override is active, it holds fans at max and defers the reset until the machine cools, so it never hands hot fans back to auto
 - Temperature anomaly detection: logs instant spikes (>5°C in 2s) and sustained changes (>10°C in 30s) with process capture
-- Privileged daemon — one-time sudo, zero password prompts after
+- Privileged helper embedded in the app — one system authorization on first launch, no sudo for daily use
 - Native Swift — lightweight, no Electron, no bloat
 
 ## Profiles
@@ -77,18 +77,9 @@ Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for
 
 ## Install
 
-### Option A: Homebrew (recommended)
-
-```bash
-brew tap ProducerGuy/tap
-brew trust --formula ProducerGuy/tap/thermalforge
-brew install thermalforge
-sudo thermalforge install
-```
-
-Homebrew requires third-party taps to be trusted before it will run their formula, which is the `brew trust` step (per-formula, Homebrew's recommended form). `brew install` builds and installs the **CLI**. `sudo thermalforge install` then sets up the background daemon (so the app can control fans without a password every time) **and copies the menu bar app into `/Applications`**. You only run it once.
-
-### Option B: From source
+ThermalForge is a self-contained app bundle: the menu bar app, the CLI, and the
+privileged background helper all live inside `ThermalForge.app`. There is no separate
+daemon or system-wide binary to install.
 
 ```bash
 git clone https://github.com/ProducerGuy/ThermalForge.git
@@ -96,7 +87,15 @@ cd ThermalForge
 ./setup.sh
 ```
 
-Builds everything, installs the CLI, creates the menu bar app in `/Applications`, and sets up the daemon. One password prompt, fully automatic.
+`setup.sh` builds all three executables, assembles the bundle into
+`/Applications/ThermalForge.app`, verifies its ad-hoc signature, and opens it. The app
+must live in `/Applications` — the embedded helper is registered relative to the bundle.
+Everything runs as your user: **no sudo and no password prompt**.
+
+On first launch macOS asks for **one** system authorization to register the embedded
+background helper (System Settings > General > Login Items & Extensions). Approve it
+there and fan control is ready; the app's menu banner guides you if the approval is
+still pending or was declined. There is nothing else to install.
 
 ### After install
 
@@ -110,41 +109,43 @@ Turn on **Launch at Login** in the menu bar dropdown and it starts automatically
 
 ## Security
 
-ThermalForge controls fans through a background daemon, and 0.2.0 locks down how you talk to it:
+ThermalForge controls fans through an embedded privileged helper: a launchd system
+daemon that ships inside the app bundle at `Contents/MacOS/thermalforge-helper`, with its
+LaunchDaemon plist at `Contents/Library/LaunchDaemons/com.thermalforge.daemon.plist`. The
+app registers it with `SMAppService` — nothing is written to `/usr/local/bin`, and no
+manual `launchctl` setup is needed. The 0.3.0 helper hardens how you talk to it:
 
-- **Private control socket.** The daemon listens on `/var/run/thermalforge.sock`, mode `0600`, owned by the user who ran `sudo thermalforge install`. Only that user and root can send fan commands — no other local account can drive your fans.
-- **Structured, versioned protocol.** The CLI, app, and daemon speak a size-capped, versioned message format. Oversized or malformed input is rejected rather than parsed, and a version mismatch surfaces as an "Update needed" prompt instead of silent divergence.
-- **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum when a critical sensor stays above 95°C for 2 seconds while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
+- **Private control socket.** The helper listens on `/var/run/thermalforge.sock`, mode `0660`, owned by `root:admin`. Only members of the `admin` group (and root) can send fan commands — no other local account can drive your fans, and admin-group users need no `sudo`.
+- **Structured, versioned protocol.** The CLI, app, and helper speak a size-capped, versioned message format. Oversized or malformed input is rejected rather than parsed. If the helper is running an older build than the app, the app detects the mismatch and restarts it automatically (re-registering if a plain restart doesn't take) instead of diverging silently.
+- **Safety enforced in the helper.** RPM requests above a fan's maximum are clamped in the helper, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum when a critical sensor stays above 95°C for 2 seconds while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
 - **Robust connection handling.** Connections are handled concurrently, bounded, and timed out, so a stuck or slow client can't stall fan control.
 
 ## FAQ
 
 **What if ThermalForge closes during normal use?**
-The daemon's heartbeat watchdog detects the app is gone within 15 seconds and resets fans to Apple defaults. On next launch, the app syncs to whatever the daemon is currently holding rather than forcing a reset — so a hold you set deliberately (e.g. `sudo thermalforge max`) survives. If a thermal safety override is active when the app dies, the watchdog keeps fans at maximum and defers the reset until the machine has cooled below the safety threshold — it never drops fans back to auto while the machine is hot.
+The daemon's heartbeat watchdog detects the app is gone within 15 seconds and resets fans to Apple defaults. On next launch, the app syncs to whatever the helper is currently holding rather than forcing a reset — so a hold you set deliberately (e.g. `thermalforge max`) survives. If a thermal safety override is active when the app dies, the watchdog keeps fans at maximum and defers the reset until the machine has cooled below the safety threshold — it never drops fans back to auto while the machine is hot.
 
 ## Resets and troubleshooting
 
 **Reset fans right now:**
 ```bash
-thermalforge auto
+/Applications/ThermalForge.app/Contents/MacOS/thermalforge auto
 ```
 Resets the fans to Apple defaults and leaves your menu bar app running. Add `--stop-app` if you also want to quit the app so the reset sticks — otherwise a running profile re-applies its curve within seconds. With `--stop-app` the menu bar icon disappears (that's expected); relaunch from Spotlight or `/Applications` when you're done.
 
 **Fans loud and won't stop? Reset them now:**
 ```bash
-sudo killall ThermalForgeApp; sudo /usr/local/bin/thermalforge auto
+pkill -x ThermalForgeApp; /Applications/ThermalForge.app/Contents/MacOS/thermalforge auto
 ```
-This always works, even if the app isn't running. It stops ThermalForge and hands fan control straight back to macOS — your fans will settle to normal within a few seconds. It writes directly to the hardware, so it doesn't depend on the app or the background service being healthy.
+This always works, even if the app isn't running. It stops ThermalForge and hands fan control straight back to macOS — your fans will settle to normal within a few seconds. Releasing to Apple auto never needs root, so this runs without `sudo`.
 
 **Completely remove ThermalForge:**
 ```bash
-sudo thermalforge uninstall
+./uninstall.sh
 ```
-Removes the daemon, binary, app, and all logs. Clean slate.
+Quits the app, hands fans back to Apple, removes the helper registration, and deletes the app bundle, user data, and logs. Clean slate.
 
-If installed via Homebrew, run `brew uninstall thermalforge` first.
-
-**"Update needed" after a Homebrew upgrade:** `brew upgrade` updates the app and CLI, but the background daemon keeps running the old build until you re-sync it. While they differ, the menu bar shows an **"Update needed"** banner and the CLI prints a version-mismatch warning, both naming the two versions. Fix it once with `sudo thermalforge install`; the banner clears when they match again.
+**Helper version mismatch after an update:** replacing `ThermalForge.app` brings a new embedded helper, but the old helper keeps running until it's cycled. The app notices the mismatch and recovers on its own: it asks the helper to restart (launchd respawns the new bundle binary, no re-authorization) and, only if that doesn't take, unregisters and re-registers it (which may show the system authorization prompt once). While recovery runs the menu bar shows a banner; if it still can't reconcile, the banner names both versions and offers a retry.
 
 ### Disclaimer
 
@@ -152,18 +153,34 @@ ThermalForge is provided as-is with no warranty. Use at your own risk.
 
 ## CLI
 
+The CLI ships inside the bundle at `Contents/MacOS/thermalforge`. Call it by full path,
+or add an alias once:
+
+```bash
+alias thermalforge=/Applications/ThermalForge.app/Contents/MacOS/thermalforge
+```
+
 ```bash
 thermalforge status        # JSON output: fan speeds + temps
-thermalforge max           # Max fans — no sudo when the daemon is running
+thermalforge max           # Max fans — no sudo (admin user)
 thermalforge auto          # Reset to Apple defaults
-thermalforge set 4000      # Set specific RPM — no sudo when the daemon is running
+thermalforge set 4000      # Set specific RPM — no sudo (admin user)
 thermalforge discover      # Dump all SMC keys (for new hardware)
 thermalforge watch         # Monitor mode with auto-boost profiles (requires sudo)
 thermalforge log           # Record thermal data to CSV (1Hz, auto-delete 24h)
 thermalforge log --rate 10 --duration 1h --no-expire   # 10Hz for 1 hour, keep forever
 ```
 
-`max` and `set` need root to unlock the fans, so when the daemon is installed they route through it and **don't need `sudo`**; without a daemon (e.g. an uninstalled from-source build) they write the hardware directly and need `sudo`. `auto` also routes through the daemon but never needed the unlock — resetting just hands control back to macOS. `watch` always needs `sudo` (it runs its own root monitor loop). Control a single fan with `--fan`, e.g. `thermalforge set 3000 --fan 1`.
+For an `admin`-group user, `max`, `set`, and `auto` route over the embedded helper's
+socket (`/var/run/thermalforge.sock`, `root:admin` `0660`) and need **no `sudo`**.
+`status` and `log` are read-only sensor reads and also need no `sudo`. Only `watch` needs
+`sudo`: it runs its own root monitoring loop and writes the SMC directly. Control a single
+fan with `--fan`, e.g. `thermalforge set 3000 --fan 1`.
+
+A CLI hold (`max` or a `set`) is unsupervised: it survives the app quitting, but it does
+**not** survive a helper restart. When the helper is restarted — a version-mismatch
+auto-recovery, `./setup.sh`, or a crash — it returns the fans to Apple auto, so re-issue
+the command after a restart if you still want the hold.
 
 Fans settle **near** a commanded target rather than exactly on it, so `status` and the menu bar report an RPM slightly above or below what you set — that's the live tach reading, not an error.
 
@@ -191,22 +208,13 @@ SMC key names vary across chip generations — ThermalForge auto-detects at star
 
 ## Uninstall
 
-### Homebrew
-
 ```bash
-brew uninstall thermalforge
-sudo thermalforge uninstall
+./uninstall.sh
 ```
 
-`thermalforge uninstall` removes the daemon, binary, app, user data, and all logs.
-
-### From source
-
-```bash
-sudo thermalforge uninstall
-```
-
-This removes the daemon, binary, app bundle, user data, and all logs.
+Quits the app, hands fans back to Apple, removes the embedded helper registration, and
+deletes the app bundle plus all user data and logs. The ThermalForge entry under System
+Settings > General > Login Items & Extensions disappears with the bundle.
 
 ## Contributing
 

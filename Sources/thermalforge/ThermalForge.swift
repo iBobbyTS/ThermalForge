@@ -43,17 +43,18 @@ struct ThermalForge: ParsableCommand {
 
 // MARK: - Daemon version reconciliation
 
-/// Warn (on stderr, non-blocking) if a background daemon from a different build
-/// is running. The daemon is a long-lived launchd process; after `brew upgrade`
-/// it keeps running the OLD binary until `thermalforge install` re-syncs it, so
-/// the menu bar app can silently diverge from this CLI. Called by every
-/// fan-affecting command. Advisory only — it never blocks the command.
+/// Warn (on stderr, non-blocking) if the embedded background helper is a
+/// different build than this CLI. The helper is a long-lived launchd process that
+/// ships inside ThermalForge.app; after the bundle is replaced it keeps running
+/// the OLD binary until the app restarts/re-registers it, so the menu bar app can
+/// silently diverge from this CLI. Called by every fan-affecting command.
+/// Advisory only — it never blocks the command.
 func warnIfDaemonVersionMismatch() {
     guard ThermalForgeDaemon.isRunning else { return }
 
-    // A legacy (pre-Phase-2) daemon can't answer the framed `version` request — but
+    // A legacy (pre-Phase-2) helper can't answer the framed `version` request — but
     // its socket is up, so this is a real mismatch that MUST warn (this is the very
-    // message telling the user to reinstall). Any other failure (daemon down /
+    // message telling the user how to re-sync). Any other failure (helper down /
     // transient) stays silent so we don't nag on a blip.
     let daemonVersion: String
     do {
@@ -69,11 +70,11 @@ func warnIfDaemonVersionMismatch() {
     }
 
     let message = """
-        ⚠️  Version mismatch: the background daemon is running \(daemonVersion), \
+        ⚠️  Version mismatch: the background helper is running \(daemonVersion), \
         but this CLI is \(ThermalForgeVersion.current).
-            They're from different installs, so the menu bar app may not behave \
-        like the command line until you re-sync them.
-            Fix it with one command:  sudo thermalforge install
+            The helper is embedded in ThermalForge.app and updates with it. Reopen \
+        ThermalForge so it restarts/re-registers the helper automatically, or use the \
+        retry in its menu banner. From source:  ./setup.sh
 
         """
     FileHandle.standardError.write(Data(message.utf8))
@@ -89,37 +90,38 @@ func reportRoute(_ route: FanRoute) {
     case .direct:
         return
     case .daemon(let version):
-        // Routed and honored. Warn only if the daemon is a different build than
+        // Routed and honored. Warn only if the helper is a different build than
         // this CLI — the command worked, but the menu bar app may differ.
         let daemonVersion = version ?? "an older build"
         guard daemonVersion != ThermalForgeVersion.current else { return }
         message = """
-            ⚠️  Version mismatch: the background daemon is running \(daemonVersion), \
+            ⚠️  Version mismatch: the background helper is running \(daemonVersion), \
             but this CLI is \(ThermalForgeVersion.current).
                 The command was applied, but the menu bar app may not behave like \
-            the command line until you re-sync.
-                Fix it with one command:  sudo thermalforge install
+            the command line until the helper is updated.
+                Reopen ThermalForge to update its embedded helper automatically \
+            (or retry from its menu banner).
 
             """
     case .daemonHoldWillRevert(let version):
         message = """
-            ⚠️  The background daemon (\(version)) is too old to hold this without \
+            ⚠️  The background helper (\(version)) is too old to hold this without \
             supervision — it will revert to auto in about 15 seconds.
-                Re-sync to make holds stick:  sudo thermalforge install
+                Reopen ThermalForge to update its embedded helper and make holds stick.
 
             """
     case .directOldDaemon(let version):
         message = """
-            ⚠️  The background daemon (\(version)) is too old to route per-fan \
+            ⚠️  The background helper (\(version)) is too old to route per-fan \
             commands, so this used a direct hardware write (which needs sudo).
-                Re-sync to drop the sudo requirement:  sudo thermalforge install
+                Reopen ThermalForge to update its embedded helper and drop the sudo requirement.
 
             """
     case .directLegacyDaemon:
         message = """
-            ⚠️  The background daemon is an older build that can't use the updated \
+            ⚠️  The background helper is an older build that can't use the updated \
             control protocol, so this used a direct hardware write.
-                Finish the upgrade to reconnect it:  sudo thermalforge install
+                Finish the upgrade by reopening ThermalForge; if it stays stale, run ./setup.sh from source.
 
             """
     }
@@ -213,9 +215,9 @@ struct SetSpeed: ParsableCommand {
     /// out-of-range value rather than clamping. When neither holds, we say the value is
     /// unknown rather than print a number we can't vouch for.
     private static let appliedUnknownByOldDaemon = """
-        Fan speed set, but the background daemon is an older build that doesn't report \
-        the applied RPM, so the exact value can't be shown. Re-sync to fix:
-          sudo thermalforge install
+        Fan speed set, but the background helper is an older build that doesn't report \
+        the applied RPM, so the exact value can't be shown. Reopen ThermalForge to \
+        update its embedded helper, then retry.
         """
 
     func run() throws {
@@ -518,19 +520,32 @@ struct Log: ParsableCommand {
 
 // MARK: - BuildApp (internal)
 
-/// Assembles ThermalForge.app from a built app binary + icon, writing the
-/// Info.plist from ThermalForgeVersion.current. This is the SINGLE place the
-/// bundle is assembled — both install paths (Homebrew formula and setup.sh)
-/// call it, so no field (version included) can drift between them.
+/// Assembles ThermalForge.app from the built app binary, the embedded CLI +
+/// privileged helper, and the icon. Writes Info.plist from
+/// ThermalForgeVersion.current and the embedded LaunchDaemon plist from
+/// `DaemonBundlePlist` (one source of truth shared with the app's SMAppService
+/// registration and the unit tests). This is the SINGLE place the bundle is
+/// assembled — setup.sh calls it, so no field (version, helper path) can drift.
+///
+/// After assembly it ad-hoc signs the nested executables and the bundle
+/// inside-out, then self-checks with `codesign --verify --deep --strict` and
+/// fails loudly (nonzero exit + explanation) if verification rejects the result,
+/// so an unsigned or malformed bundle is never installed.
 struct BuildApp: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "build-app",
-        abstract: "Assemble ThermalForge.app from a built app binary and icon (internal)",
+        abstract: "Assemble ThermalForge.app from built binaries and icon (internal)",
         shouldDisplay: false
     )
 
     @Option(name: .long, help: "Path to the built ThermalForgeApp executable")
     var binary: String
+
+    @Option(name: .long, help: "Path to the built thermalforge CLI executable")
+    var cli: String
+
+    @Option(name: .long, help: "Path to the built thermalforge-helper executable")
+    var helper: String
 
     @Option(name: .long, help: "Path to the .icns app icon")
     var icon: String
@@ -541,8 +556,10 @@ struct BuildApp: ParsableCommand {
     func run() throws {
         let fm = FileManager.default
 
-        guard fm.fileExists(atPath: binary) else {
-            throw ValidationError("App binary not found: \(binary)")
+        for (label, path) in [("App binary", binary), ("CLI", cli), ("Helper", helper)] {
+            guard fm.fileExists(atPath: path) else {
+                throw ValidationError("\(label) not found: \(path)")
+            }
         }
         guard fm.fileExists(atPath: icon) else {
             throw ValidationError("Icon not found: \(icon)")
@@ -551,6 +568,7 @@ struct BuildApp: ParsableCommand {
         let contents = "\(dest)/Contents"
         let macOSDir = "\(contents)/MacOS"
         let resources = "\(contents)/Resources"
+        let launchDaemons = "\(contents)/Library/LaunchDaemons"
 
         // Replace any existing bundle so a rebuild is clean.
         if fm.fileExists(atPath: dest) {
@@ -558,8 +576,14 @@ struct BuildApp: ParsableCommand {
         }
         try fm.createDirectory(atPath: macOSDir, withIntermediateDirectories: true)
         try fm.createDirectory(atPath: resources, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: launchDaemons, withIntermediateDirectories: true)
 
-        try fm.copyItem(atPath: binary, toPath: "\(macOSDir)/ThermalForgeApp")
+        // Three executables in Contents/MacOS, all forced 0755. The app binary
+        // keeps the name Info.plist declares; the CLI and helper are the
+        // bundle-distributed names the socket client and BundleProgram resolve.
+        try copyExecutable(from: binary, to: "\(macOSDir)/ThermalForgeApp")
+        try copyExecutable(from: cli, to: "\(macOSDir)/thermalforge")
+        try copyExecutable(from: helper, to: "\(macOSDir)/thermalforge-helper")
         try fm.copyItem(atPath: icon, toPath: "\(resources)/AppIcon.icns")
 
         let plist = """
@@ -595,6 +619,77 @@ struct BuildApp: ParsableCommand {
             """
         try plist.write(toFile: "\(contents)/Info.plist", atomically: true, encoding: .utf8)
 
+        // The embedded LaunchDaemon plist SMAppService.daemon(plistName:) installs.
+        // Generated from the Core pure function so the assembler, the app, and the
+        // tests share one definition — never hand-written here.
+        try DaemonBundlePlist.contents().write(
+            toFile: "\(launchDaemons)/\(DaemonBundlePlist.filename)",
+            atomically: true,
+            encoding: .utf8
+        )
+
+        // SMAppService only accepts a signed bundle; ad-hoc is enough for a local,
+        // unnotarized build. Sign inside-out: each nested executable, the main
+        // binary if the toolchain left it unsigned, then the bundle that seals them.
+        try sign("\(macOSDir)/thermalforge")
+        try sign("\(macOSDir)/thermalforge-helper")
+        if !isSigned("\(macOSDir)/ThermalForgeApp") {
+            try sign("\(macOSDir)/ThermalForgeApp")
+        }
+        try sign(dest)
+
+        try verify(dest)
+
         print("Assembled \(dest) (version \(ThermalForgeVersion.current))")
+    }
+
+    // MARK: - Assembly helpers
+
+    /// Copy a built executable into the bundle and force the executable bit,
+    /// regardless of how the toolchain laid it down.
+    private func copyExecutable(from source: String, to destination: String) throws {
+        let fm = FileManager.default
+        try fm.copyItem(atPath: source, toPath: destination)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination)
+    }
+
+    /// Run a tool to completion, returning its exit status and stderr.
+    @discardableResult
+    private func run(_ tool: String, _ arguments: [String]) throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(data: errData, encoding: .utf8) ?? "")
+    }
+
+    /// Ad-hoc sign one file or bundle. `-f` replaces any existing signature so a
+    /// stale/invalid one can't survive the rebuild.
+    private func sign(_ path: String) throws {
+        let (status, stderr) = try run("/usr/bin/codesign", ["-f", "--sign", "-", path])
+        guard status == 0 else {
+            throw ValidationError("codesign failed for \(path):\n\(stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+
+    private func isSigned(_ path: String) -> Bool {
+        (try? run("/usr/bin/codesign", ["--verify", "--quiet", path]).status) == 0
+    }
+
+    /// Verify the finished bundle and fail loudly — never install an unsigned or
+    /// malformed bundle.
+    private func verify(_ path: String) throws {
+        let (status, stderr) = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", path])
+        guard status == 0 else {
+            throw ValidationError("""
+                codesign verification FAILED for \(path); refusing to install an invalid bundle.
+                \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))
+                """)
+        }
     }
 }

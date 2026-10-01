@@ -129,8 +129,8 @@ final class ConnectionServer: @unchecked Sendable {
             case .legacyPeer:
                 // Reply in the pre-Phase-2 client's own "error:" format (raw, not a frame)
                 // so its hasPrefix("error:") surfaces guidance instead of misreading a frame.
-                NSLog("ThermalForge daemon: legacy (pre-Phase-2) client — advising reinstall")
-                writeRaw(io, "error: daemon protocol updated; reinstall the CLI: sudo thermalforge install\n",
+                NSLog("ThermalForge helper: legacy (pre-Phase-2) client — advising helper update")
+                writeRaw(io, "error: daemon protocol updated; reopen ThermalForge to update its embedded helper\n",
                          queue: q, completion: finish)
             case .oversized:
                 NSLog("ThermalForge daemon: rejected oversized request frame")
