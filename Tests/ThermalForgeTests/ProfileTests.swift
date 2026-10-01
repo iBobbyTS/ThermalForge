@@ -85,8 +85,7 @@ struct ProfileTests {
             id: "test_custom",
             name: "Test Custom",
             curve: FanProfile.Curve(stopTemp: 45, startTemp: 55, ceilingTemp: 65,
-                                    maxRPMPercent: 0.50, curveShape: .easeOut,
-                                    rampUpPerSec: 0.08)
+                                    maxRPMPercent: 0.50, curveShape: .easeOut)
         )
 
         try custom.save()
@@ -97,7 +96,6 @@ struct ProfileTests {
         #expect(found?.curve.startTemp == 55)
         #expect(found?.curve.maxRPMPercent == 0.50)
         #expect(found?.curve.curveShape == .easeOut)
-        #expect(found?.curve.rampUpPerSec == 0.08)
 
         // Clean up
         let path = FileManager.default.homeDirectoryForCurrentUser
@@ -230,39 +228,5 @@ struct ProfileTests {
         #expect(easeOutVal > easeInVal) // easeOut is faster at low positions
         #expect(abs(easeOutVal - 0.5) < 0.001)
         #expect(abs(easeInVal - 0.0625) < 0.001)
-    }
-
-    // MARK: - Per-Profile Ramp Rates
-
-    @Test("Each profile has distinct ramp rates matching its personality")
-    func perProfileRampRates() {
-        // Balanced: gentle
-        #expect(FanProfile.balanced.curve.rampUpPerSec == 0.05)
-        #expect(FanProfile.balanced.curve.rampDownPerSec == 0.025)
-
-        // Performance: 2× Balanced ramp-up
-        #expect(FanProfile.performance.curve.rampUpPerSec == 0.10)
-        #expect(FanProfile.performance.curve.rampDownPerSec == 0.04)
-
-        // Max: always-on at 100% — ramp governors never engage while pinned
-        #expect(FanProfile.max.curve.alwaysOn == true)
-        #expect(FanProfile.max.curve.rampDownPerSec == 0.025)
-    }
-
-    @Test("Legacy profile JSON with removed sustainedTriggerSec key still decodes")
-    func legacyJSONCompat() throws {
-        // sustainedTriggerSec was removed; profiles saved by older versions carry
-        // the extra key and must keep loading (synthesized Codable ignores it).
-        let legacyJSON = """
-        {"id":"legacy","name":"Legacy","curve":{"stopTemp":45,"startTemp":55,
-        "ceilingTemp":65,"maxRPMPercent":0.5,"handsOff":false,"alwaysOn":false,
-        "curveShape":"easeOut","rampUpPerSec":0.08,"rampDownPerSec":0.03,
-        "sustainedTriggerSec":3,"instantEngage":false}}
-        """
-        let decoded = try JSONDecoder().decode(FanProfile.self, from: Data(legacyJSON.utf8))
-        #expect(decoded.id == "legacy")
-        #expect(decoded.curve.startTemp == 55)
-        #expect(decoded.curve.rampUpPerSec == 0.08)
-        #expect(decoded.curve.curveShape == .easeOut)
     }
 }

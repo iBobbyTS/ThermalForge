@@ -73,7 +73,11 @@ public final class ThermalMonitor {
 
     // MARK: - Fan State
 
-    private var lastAppliedRPMPercent: Float = 0
+    /// Owns the current-speed trajectory toward each tick's curve target
+    /// (PT1 exponential approach). See FanSpeedController.
+    private var speedController = FanSpeedController()
+    /// What was last actually SENT to the fans, for the write deadband.
+    private var lastWrittenRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
 
     // MARK: - Safety Override
@@ -133,7 +137,7 @@ public final class ThermalMonitor {
 
     /// Update the active profile. Switching itself sends no fan command: the
     /// next tick computes the new profile's target from the current temperature
-    /// and the ramp governors move toward it — so the tracked fan state must
+    /// and the speed controller moves toward it — so the tracked fan state must
     /// stay truthful here. It is cleared only via resetFanState, at the places
     /// that actually send a resetAuto and hand fans back to the system.
     public func switchProfile(_ profile: FanProfile) {
@@ -147,7 +151,8 @@ public final class ThermalMonitor {
     public func resetFanState() {
         queue.async { [self] in
             fansCurrentlyRunning = false
-            lastAppliedRPMPercent = 0
+            speedController.reset()
+            lastWrittenRPMPercent = 0
         }
     }
 
@@ -178,7 +183,8 @@ public final class ThermalMonitor {
             applyCommand(.setMax)
             state = .safetyOverride
             fansCurrentlyRunning = true
-            lastAppliedRPMPercent = 1.0
+            speedController.resync(1.0)
+            lastWrittenRPMPercent = 1.0
             TFLogger.shared.safety(
                 "Override triggered: \(String(format: "%.1f", maxTemp))°C sustained "
                     + "\(Int(FanProfile.safetySustainSeconds.rounded()))s — fans maxed [\(activeProfile.name)]"
@@ -198,8 +204,8 @@ public final class ThermalMonitor {
             TFLogger.shared.safety(
                 "Override cleared at \(String(format: "%.1f", maxTemp))°C — resuming \(activeProfile.name)"
             )
-            // Fall through: tickCurve resumes the profile, and its ramp-down
-            // governor eases fans off max instead of dropping them.
+            // Fall through: tickCurve resumes the profile, and the speed
+            // controller eases fans off max instead of dropping them.
         }
 
         tickCurve(status: status, peakTemp: maxTemp)
@@ -286,7 +292,8 @@ public final class ThermalMonitor {
             if fansCurrentlyRunning {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
+                speedController.reset()
+                lastWrittenRPMPercent = 0
                 state = .idle
             }
             return
@@ -311,7 +318,8 @@ public final class ThermalMonitor {
             if offAction == .release {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
+                speedController.reset()
+                lastWrittenRPMPercent = 0
                 state = .idle
                 TFLogger.shared.fan(
                     "Fans off: \(String(format: "%.1f", peakTemp))°C sustained "
@@ -330,31 +338,37 @@ public final class ThermalMonitor {
         // Clamp to valid range
         targetPct = min(max(targetPct, minRPM / maxRPM), curve.maxRPMPercent)
 
-        // Ramp governors — per-profile rates, per-tick amounts
-        let rampUp = curve.rampUpPerSec * tickInterval
-        let rampDown = curve.rampDownPerSec * tickInterval
+        // Bumpless transfer: taking over from Apple auto, seed the controller
+        // from the OBSERVED speed. Assuming a standstill would hand the first
+        // tick a huge error and slam the fans; seeding reality makes the
+        // takeover continuous with whatever macOS was doing.
+        if !fansCurrentlyRunning {
+            let observedPct = status.fans.first.map { Float($0.actualRPM) / maxRPM } ?? 0
+            let seed = min(max(observedPct, minRPM / maxRPM), 1)
+            speedController.resync(seed)
+            lastWrittenRPMPercent = seed
+        }
 
-        if targetPct > lastAppliedRPMPercent {
-            if !curve.instantEngage {
-                // Governed ramp-up
-                targetPct = min(targetPct, lastAppliedRPMPercent + rampUp)
-            }
-            // instantEngage: skip governor, jump directly to target
-        } else if targetPct < lastAppliedRPMPercent {
-            // Ramp-down governor always applies (even for instantEngage profiles)
-            targetPct = max(targetPct, lastAppliedRPMPercent - rampDown)
+        // Speed controller — PT1 approach, one step toward the target.
+        // instantEngage keeps its contract: upward jumps bypass the controller
+        // entirely; downward always glides.
+        if curve.instantEngage && targetPct > speedController.current {
+            speedController.resync(targetPct)
+        } else {
+            _ = speedController.advance(target: targetPct, dt: tickInterval)
         }
 
         // Apply if changed meaningfully (threshold scaled for 100ms ticks)
-        if abs(targetPct - lastAppliedRPMPercent) > 0.002 {
-            let targetRPM = max(maxRPM * targetPct, minRPM)
+        let appliedPct = speedController.current
+        if abs(appliedPct - lastWrittenRPMPercent) > 0.002 {
+            let targetRPM = max(maxRPM * appliedPct, minRPM)
             applyCommand(.setRPM(targetRPM))
 
             if !fansCurrentlyRunning {
                 TFLogger.shared.fan("Fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", peakTemp))°C [\(activeProfile.name)]")
             }
 
-            lastAppliedRPMPercent = targetPct
+            lastWrittenRPMPercent = appliedPct
             fansCurrentlyRunning = true
             state = .active(profileName: activeProfile.name)
         } else if fansCurrentlyRunning {

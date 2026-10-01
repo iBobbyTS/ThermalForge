@@ -4,15 +4,16 @@
 //
 //  Fan control profiles with proportional temperature curves.
 //
-//  Each profile defines a curve that maps temperature to fan speed,
-//  along with per-profile ramp rates and curve shapes.
+//  Each profile defines a curve that maps temperature to a TARGET fan speed;
+//  the shared FanSpeedController (PT1 exponential approach, <=3s to any
+//  target) owns how the current speed moves toward it.
 //
 //  Based on Apple fan hardware research:
 //  - 0 to minimum RPM is binary (hardware limitation)
-//  - Above minimum, proportional ramping with configurable curve shape
+//  - Above minimum, proportional control with configurable curve shape
 //  - Start/stop cycles are the #1 fan bearing wear factor
 //  - At least 5°C hysteresis between start and stop thresholds
-//  - Ramp governors are acoustic comfort, not bearing protection
+//  - The speed controller is acoustic comfort, not bearing protection
 //
 
 import Foundation
@@ -65,21 +66,13 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         /// How temperature maps to fan speed in the proportional zone.
         public let curveShape: CurveShape
 
-        /// Max fan speed increase per second (fraction of max RPM per second).
-        /// Ignored when instantEngage is true.
-        public let rampUpPerSec: Float
-
-        /// Max fan speed decrease per second (fraction of max RPM per second).
-        public let rampDownPerSec: Float
-
-        /// If true, skip ramp-up governor — jump directly to maxRPMPercent.
-        /// Ramp-down governor still applies for smooth deceleration.
+        /// If true, skip the speed controller's ramp-up — jump directly to
+        /// target. Ramp-down still goes through the controller.
         public let instantEngage: Bool
 
         public init(stopTemp: Float = 50, startTemp: Float = 55, ceilingTemp: Float = 70,
                     maxRPMPercent: Float = 0.6, handsOff: Bool = false, alwaysOn: Bool = false,
-                    curveShape: CurveShape = .linear, rampUpPerSec: Float = 0.05,
-                    rampDownPerSec: Float = 0.025,
+                    curveShape: CurveShape = .linear,
                     instantEngage: Bool = false) {
             self.stopTemp = stopTemp
             self.startTemp = startTemp
@@ -88,8 +81,6 @@ public struct FanProfile: Codable, Identifiable, Equatable {
             self.handsOff = handsOff
             self.alwaysOn = alwaysOn
             self.curveShape = curveShape
-            self.rampUpPerSec = rampUpPerSec
-            self.rampDownPerSec = rampDownPerSec
             self.instantEngage = instantEngage
         }
 
@@ -145,22 +136,6 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         self.name = name
         self.curve = curve
     }
-
-    // Legacy support — old profiles used triggers/fanBehavior
-    public struct Triggers: Codable, Equatable {
-        public let cpuTemp: Float?
-        public let gpuTemp: Float?
-        public let memPressure: Float?
-        public init(cpuTemp: Float? = nil, gpuTemp: Float? = nil, memPressure: Float? = nil) {
-            self.cpuTemp = cpuTemp; self.gpuTemp = gpuTemp; self.memPressure = memPressure
-        }
-    }
-    public struct FanBehavior: Codable, Equatable {
-        public let mode: Mode
-        public let rpmPercent: Float
-        public enum Mode: String, Codable, Equatable { case auto, manual }
-        public init(mode: Mode, rpmPercent: Float) { self.mode = mode; self.rpmPercent = rpmPercent }
-    }
 }
 
 // MARK: - Built-in Profiles
@@ -180,18 +155,15 @@ extension FanProfile {
         id: "balanced",
         name: "Balanced",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 70,
-                     maxRPMPercent: 0.60, curveShape: .easeIn,
-                     rampUpPerSec: 0.05, rampDownPerSec: 0.025)
+                     maxRPMPercent: 0.60, curveShape: .easeIn)
     )
 
     /// Performance: linear curve, fast response. Thermals over noise.
-    /// 2× ramp-up speed vs Balanced.
     public static let performance = FanProfile(
         id: "performance",
         name: "Performance",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 65,
-                     maxRPMPercent: 0.85, curveShape: .linear,
-                     rampUpPerSec: 0.10, rampDownPerSec: 0.04)
+                     maxRPMPercent: 0.85, curveShape: .linear)
     )
 
     /// Max: fans pinned at 100%, no temperature conditions. Selecting it means
@@ -201,7 +173,6 @@ extension FanProfile {
         name: "Max",
         curve: Curve(stopTemp: 50, startTemp: 65, ceilingTemp: 65,
                      maxRPMPercent: 1.0, alwaysOn: true, curveShape: .linear,
-                     rampUpPerSec: 1.0, rampDownPerSec: 0.025,
                      instantEngage: true)
     )
 
@@ -254,6 +225,23 @@ extension FanProfile {
         }
         return profiles
     }
+}
+
+// MARK: - Speed Control
+
+extension FanProfile {
+    /// PT1 approach time-constant, target ABOVE current (seconds). See
+    /// FanSpeedController for the algorithm; the taus are sized from the 3s
+    /// convergence deadline: tau <= 3 / ln(err0 / snap). Worst real span is
+    /// min→max RPM (≈0.296→1.0 on this hardware, err0 ≈ 0.70), so with snap
+    /// 0.01 the bound is tau <= 0.71 — 0.55 leaves margin (~2.4s worst case).
+    public static let speedTauUpSeconds: Float = 0.55
+    /// Same, target BELOW current. Slightly larger than up: the old governors'
+    /// acoustic intent (gentle deceleration) kept, still ~2.8s worst case.
+    public static let speedTauDownSeconds: Float = 0.65
+    /// Land exactly on the target once within this fraction of max RPM —
+    /// makes "reached target" exact instead of asymptotic.
+    public static let speedSnapFraction: Float = 0.01
 }
 
 // MARK: - Safety
