@@ -348,6 +348,7 @@ public final class ThermalMonitor {
                 // one-shot). Without the flag there is nothing to reconcile.
                 applyCommand(.resetAuto)
                 forceNextWrite = false
+                state = .idle
             }
             return
         }
@@ -378,6 +379,7 @@ public final class ThermalMonitor {
                 if forceNextWrite {
                     applyCommand(.resetAuto)
                     forceNextWrite = false
+                    state = .idle
                 }
                 return
             }

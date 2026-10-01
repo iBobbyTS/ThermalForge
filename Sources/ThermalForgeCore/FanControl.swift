@@ -302,15 +302,21 @@ public final class FanControl {
         // confirmed reset and must not proceed on a silent no-op — but only after
         // all writes have been tried. Remember the first failing key for the error.
         var firstFailedKey: String?
+        // Fans whose AUTO-mode write failed stay in manual mode; writing their
+        // target to 0 anyway would command a manual 0 RPM — a stopped, unsupervised
+        // fan. They keep their last (spinning) target instead and the throw makes
+        // the caller retry the whole reset.
+        var modeWriteFailed = [Bool](repeating: false, count: count)
 
         for i in 0..<count {
             let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            if !smc.writeKey(modeKey, bytes: [0]), firstFailedKey == nil {
-                firstFailedKey = modeKey
+            if !smc.writeKey(modeKey, bytes: [0]) {
+                modeWriteFailed[i] = true
+                if firstFailedKey == nil { firstFailedKey = modeKey }
             }
         }
 
-        for i in 0..<count {
+        for i in 0..<count where !modeWriteFailed[i] {
             let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
             if !smc.writeKey(targetKey, bytes: floatToSMCBytes(0)), firstFailedKey == nil {
                 firstFailedKey = targetKey
