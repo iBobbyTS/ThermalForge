@@ -43,6 +43,14 @@ public struct SafetyOverrideGate {
         self.sustainTicks = max(1, sustainTicks)
     }
 
+    /// Forget the current episode so the next controlled tick must re-earn
+    /// engagement through the full sustained-heat window. Used when the monitor is
+    /// forced to re-take control after the helper recovers (forceReengage).
+    public mutating func reset() {
+        hotTicks = 0
+        engaged = false
+    }
+
     public enum Action: Equatable {
         /// Transition to maxed — apply setMax once.
         case engage

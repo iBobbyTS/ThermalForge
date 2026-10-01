@@ -97,6 +97,22 @@ struct StandaloneHelperTests {
         #expect(!xml.contains("/usr/"))
     }
 
+    @Test("restart race guard classifies mutating vs read-only verbs")
+    func restartRejectionClassification() {
+        // Mutating verbs are refused once a restart shutdown is armed, so no writer
+        // can slip a manual RPM in between resetAuto and exit(0).
+        let mutating: [DaemonRequest.Verb] = [.max, .set, .setfan, .heartbeat]
+        for verb in mutating {
+            #expect(verb.isFanMutatingDuringRestart, "\(verb) must be rejected while restarting")
+        }
+        // Read-only verbs, the safe reset (`auto`), and `restart` itself stay
+        // answerable — clients must still be able to observe and retry.
+        let answerable: [DaemonRequest.Verb] = [.auto, .status, .state, .version, .restart]
+        for verb in answerable {
+            #expect(!verb.isFanMutatingDuringRestart, "\(verb) must still be answered while restarting")
+        }
+    }
+
     @Test("socket umask yields exactly rw-rw---- (0660)")
     func socketModeMath() {
         // Socket files are created 0777 & ~umask. 0117 gives 0660 — the

@@ -366,6 +366,12 @@ final class AppState: ObservableObject {
             // and so the recovery owns the polling window.
             if daemonRecoveryWindow.isActive { return }
 
+            // Capture the recovery generation BEFORE the socket I/O below. A tick
+            // that began before a recovery window opened can still be in flight when
+            // that window starts and ends; re-checking only `isActive` in the
+            // completion would miss it. If the generation moved, the result is stale.
+            let recoveryGeneration = daemonRecoveryWindow.currentGeneration
+
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
             // liveness and the daemon watchdog reverts after 15s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
@@ -410,6 +416,12 @@ final class AppState: ObservableObject {
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // A recovery window began (or completed) while this tick's socket
+                // I/O was in flight. Its reachability/version results belong to the
+                // pre-recovery world — applying them could increment
+                // heartbeatFailures and flip daemonUnreachable mid-recovery. Discard
+                // the whole tick.
+                guard daemonRecoveryWindow.currentGeneration == recoveryGeneration else { return }
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
                 if didReadState { self.externalHold = holdValue }
                 // A definitive version read that disagrees with this build is the
@@ -683,12 +695,19 @@ final class AppState: ObservableObject {
                     self.daemonRecoveryExhausted = false
                     self.heartbeatFailures = 0
                     self.daemonUnreachable = false
-                    // The helper exited through resetAuto, so the fans are back in
-                    // Apple auto and the monitor's tracked runtime state is stale.
-                    // Forget it so the next tick re-seeds from the observed RPM and
-                    // re-writes / re-holds naturally (bumpless takeover).
-                    self.monitor?.resetFanState()
-                    TFLogger.shared.info("Helper version recovered — monitor reseeded from observed RPM")
+                    if self.externalHold == nil {
+                        // The helper exited through resetAuto, so the fans are back
+                        // in Apple auto and its app hold is gone. Force the next
+                        // monitor tick to re-take control and issue one write that
+                        // rebuilds a fresh supervised hold (the deadband is defeated
+                        // for that tick).
+                        self.monitor?.forceReengage()
+                        TFLogger.shared.info("Helper version recovered — monitor force-re-engaging to rebuild the hold")
+                    } else {
+                        // A CLI hold owns the fans; do not force the app to take
+                        // control back over it.
+                        TFLogger.shared.info("Helper version recovered — CLI hold active; leaving fan control to the CLI")
+                    }
                 case .failed(let version):
                     self.daemonVersionMismatch = version
                     self.daemonRecoveryExhausted = true
@@ -720,8 +739,16 @@ final class AppState: ObservableObject {
 
         // (1) Ask the helper to exit; launchd's KeepAlive respawns the bundle
         // binary. A daemon too old to know `.restart` answers unsupported (ok ==
-        // false) rather than throwing — proceed to the same polling either way.
-        _ = try? client.restart()
+        // false) rather than throwing.
+        if let restartResponse = try? client.restart(),
+           restartResponse.error == .unsupportedVersion {
+            // The running helper predates `.restart`, so it cannot act on the verb.
+            // Fall back to the existing launchctl kickstart (the same path the
+            // "Restart daemon" button uses) to force a respawn from the current
+            // registration before re-registering from the bundle.
+            TFLogger.shared.info("Helper predates .restart — falling back to launchctl kickstart")
+            AppState.kickstartDaemon()
+        }
 
         // (2) Tolerate the unreachable window. Eight probes spaced a second apart
         // cover ~10s; each bounded connect/read failure costs up to the client
@@ -768,26 +795,34 @@ final class AppState: ObservableObject {
     /// and handles the credential; the app never sees it. On success the next
     /// heartbeat clears `daemonUnreachable`.
     func restartDaemon() {
-        let label = ThermalForgeDaemon.label
         DispatchQueue.global(qos: .userInitiated).async {
-            // Escaped for AppleScript's `do shell script`; the label is a fixed
-            // constant (no user input), so there's nothing untrusted to inject.
-            let script = "do shell script \"/bin/launchctl kickstart -k system/\(label)\" with administrator privileges"
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            p.arguments = ["-e", script]
-            do {
-                try p.run()
-                p.waitUntilExit()
-                if p.terminationStatus == 0 {
-                    TFLogger.shared.info("Restart daemon: launchctl kickstart requested")
-                } else {
-                    // Non-zero includes the user cancelling the auth prompt (-128).
-                    TFLogger.shared.error("Restart daemon failed (osascript exit \(p.terminationStatus))")
-                }
-            } catch {
-                TFLogger.shared.error("Restart daemon failed to launch: \(error)")
+            AppState.kickstartDaemon()
+        }
+    }
+
+    /// Force launchd to restart the helper via `launchctl kickstart -k`, through an
+    /// admin-authorized `osascript` prompt. Shared by the "Restart daemon" button
+    /// and the version-recovery kickstart fallback for a helper too old to
+    /// understand `.restart`. Blocking (waits on the auth dialog) — call off-main.
+    nonisolated static func kickstartDaemon() {
+        // Escaped for AppleScript's `do shell script`; the label is a fixed
+        // constant (no user input), so there's nothing untrusted to inject.
+        let label = ThermalForgeDaemon.label
+        let script = "do shell script \"/bin/launchctl kickstart -k system/\(label)\" with administrator privileges"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        do {
+            try p.run()
+            p.waitUntilExit()
+            if p.terminationStatus == 0 {
+                TFLogger.shared.info("Restart daemon: launchctl kickstart requested")
+            } else {
+                // Non-zero includes the user cancelling the auth prompt (-128).
+                TFLogger.shared.error("Restart daemon failed (osascript exit \(p.terminationStatus))")
             }
+        } catch {
+            TFLogger.shared.error("Restart daemon failed to launch: \(error)")
         }
     }
 
@@ -817,10 +852,20 @@ final class AppState: ObservableObject {
 private final class DaemonRecoveryWindow: @unchecked Sendable {
     private let lock = NSLock()
     private var active = false
+    /// Monotonic count of recovery windows that have begun. A heartbeat tick
+    /// captures it before its socket I/O; if it changed by completion, a recovery
+    /// started (or finished) while the tick was in flight, so its result is stale
+    /// and must be discarded rather than incrementing the reachability counter.
+    private var generation: UInt64 = 0
 
     var isActive: Bool {
         lock.lock(); defer { lock.unlock() }
         return active
+    }
+
+    var currentGeneration: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return generation
     }
 
     /// Claim the window; returns false when one is already in progress.
@@ -828,6 +873,7 @@ private final class DaemonRecoveryWindow: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if active { return false }
         active = true
+        generation &+= 1
         return true
     }
 

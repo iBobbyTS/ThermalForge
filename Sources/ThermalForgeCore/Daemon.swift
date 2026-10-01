@@ -265,7 +265,8 @@ public final class DaemonServer {
 
     /// One-shot guard for `.restart` shutdown. Both the response-write completion
     /// and the 5s fallback timer can call it; whichever runs first wins, and the
-    /// other becomes a no-op rather than a second `exit`.
+    /// other becomes a no-op rather than a second `exit`. Cleared again if the
+    /// resetAuto that gates the exit fails, so a later `.restart` can retry.
     private let restartLock = NSLock()
     private var restartScheduled = false
 
@@ -669,7 +670,19 @@ public final class DaemonServer {
             return ConnectionReply(.unsupported(daemonVersion: ThermalForgeVersion.current))
         }
         smcLock.lock()
-        let response = process(request)
+        let response: DaemonResponse
+        if request.verb.isFanMutatingDuringRestart, isRestartScheduled() {
+            // A restart shutdown is armed: from here to exit(0) the shutdown path
+            // owns the SMC and has already reset the fans to Apple auto. Refuse any
+            // new fan/hold mutation so no writer can slip a manual RPM in between
+            // resetAuto and exit. Checked under smcLock (the same lock the shutdown
+            // path holds through exit) so a write can't pass this check and then
+            // land after the reset. Read-only verbs and the safe `auto` reset still
+            // answer.
+            response = .failure(.internal, "restarting")
+        } else {
+            response = process(request)
+        }
         smcLock.unlock()
         // Verb + outcome only — never raw client bytes.
         NSLog("ThermalForge daemon: verb=%@ outcome=%@", request.verb.rawValue,
@@ -709,22 +722,42 @@ public final class DaemonServer {
         return { [weak self] in self?.performRestartShutdown() }
     }
 
+    /// True once a restart shutdown has been armed. Consulted under smcLock by
+    /// processFrame so fan mutations are refused for the resetAuto→exit window.
+    private func isRestartScheduled() -> Bool {
+        restartLock.lock(); defer { restartLock.unlock() }
+        return restartScheduled
+    }
+
     private func performRestartShutdown() {
+        // Hold smcLock across the whole shutdown. On abort it is released (the
+        // helper keeps serving); on success exit(0) runs still holding it, so no
+        // fan write can interleave between resetAuto and process teardown. Lock
+        // order (smcLock → restartLock) matches processFrame's rejection check.
+        smcLock.lock()
+
         restartLock.lock()
         if restartScheduled {
             restartLock.unlock()
+            smcLock.unlock()
             return
         }
         restartScheduled = true
         restartLock.unlock()
 
-        smcLock.lock()
         do {
             try fanControl.resetAuto()
         } catch {
-            NSLog("ThermalForge daemon: resetAuto on restart failed: %@", "\(error)")
+            // Exit ONLY when the fans are confirmed back on Apple auto. Exiting into
+            // an unsupervised manual state (the app is not required to be running)
+            // is the unsafe outcome the reset exists to prevent, so abort: log
+            // loudly, clear the armed state so a later `.restart` retries, and keep
+            // serving. A stuck old helper plus the app's re-register path is safer.
+            NSLog("ThermalForge daemon: resetAuto on restart FAILED: %@ — aborting restart, staying alive", "\(error)")
+            restartLock.lock(); restartScheduled = false; restartLock.unlock()
+            smcLock.unlock()
+            return
         }
-        smcLock.unlock()
 
         stateLock.lock(); hold = .none; safetySuspended = false; stateLock.unlock()
         NSLog("ThermalForge daemon: restart requested — fans reset to Apple auto, exiting for launchd respawn")
@@ -856,6 +889,22 @@ public final class DaemonServer {
     deinit {
         close(socketFD)
         unlink(ThermalForgeDaemon.socketPath)
+    }
+}
+
+// MARK: - Restart race guard
+
+extension DaemonRequest.Verb {
+    /// Verbs that write fan/hold state and are therefore refused once a restart
+    /// shutdown is armed (processFrame). `auto` is a safe reset — it moves fans
+    /// toward Apple auto, the same direction as the shutdown — and the read-only
+    /// verbs (`status`/`state`/`version`) plus `restart` itself stay answerable so
+    /// clients can observe the helper and a retry can be issued.
+    var isFanMutatingDuringRestart: Bool {
+        switch self {
+        case .max, .set, .setfan, .heartbeat: return true
+        case .auto, .status, .state, .version, .restart: return false
+        }
     }
 }
 

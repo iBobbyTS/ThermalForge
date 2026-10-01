@@ -82,6 +82,21 @@ struct SafetyOverrideGateTests {
         #expect(gate.evaluate(handsOff: false, temp: 97) == .engage)
     }
 
+    @Test("reset() forces a fresh sustained window before re-engagement")
+    func resetForcesFreshWindow() {
+        var gate = SafetyOverrideGate()
+        for _ in 0..<19 { _ = gate.evaluate(handsOff: false, temp: 96) }
+        #expect(gate.evaluate(handsOff: false, temp: 96) == .engage)
+        // Force re-take: the engaged episode is forgotten.
+        gate.reset()
+        // Hot immediately, but the full window must be re-earned (not an instant
+        // .hold or .engage left over from the reset episode).
+        for _ in 0..<19 {
+            #expect(gate.evaluate(handsOff: false, temp: 96) == .normal)
+        }
+        #expect(gate.evaluate(handsOff: false, temp: 96) == .engage)
+    }
+
     @Test("thresholds mirror FanProfile, not hardcoded numbers")
     func thresholdsMirrorProfile() {
         let gate = SafetyOverrideGate()

@@ -77,6 +77,19 @@ struct FanOffGateTests {
         #expect(gate.evaluate(temp: 50.1, stopTemp: 50) == .resume)
     }
 
+    @Test("reset() forgets the cold streak so release must be re-earned")
+    func resetForgetsColdStreak() {
+        var gate = FanOffGate()
+        // Nearly at the release window...
+        for _ in 0..<49 { _ = gate.evaluate(temp: 49, stopTemp: 50) }
+        // ...then a forced re-take forgets it.
+        gate.reset()
+        // Still cold, but the window starts over: no instant release.
+        #expect(gate.evaluate(temp: 49, stopTemp: 50) == .holdMinimum)
+        for _ in 0..<48 { _ = gate.evaluate(temp: 49, stopTemp: 50) }
+        #expect(gate.evaluate(temp: 49, stopTemp: 50) == .release)
+    }
+
     @Test("window mirrors FanProfile, not hardcoded numbers")
     func windowMirrorsProfile() {
         let gate = FanOffGate()

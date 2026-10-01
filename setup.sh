@@ -48,14 +48,31 @@ pkill -x ThermalForgeApp 2>/dev/null || true
 sleep 1
 
 echo "Replacing $FINAL..."
-if [ -e "$FINAL" ] && ! rm -rf "$FINAL" 2>/dev/null; then
+# Atomic-ish replace with rollback: move the old bundle aside, move the verified
+# staging bundle into place, then drop the backup. Never leave the machine with a
+# half-replaced app: if either move fails, the previous bundle is restored.
+BACKUP="$FINAL.old.$$"
+if [ -e "$FINAL" ]; then
+    if ! mv "$FINAL" "$BACKUP" 2>/dev/null; then
+        echo ""
+        echo "ERROR: could not move the existing $FINAL aside (likely a root-owned legacy bundle)."
+        echo "Run the legacy cleanup once, then re-run ./setup.sh:"
+        echo "  sudo launchctl bootout system/com.thermalforge.daemon; sudo rm -rf $FINAL /Library/LaunchDaemons/com.thermalforge.daemon.plist /usr/local/bin/thermalforge"
+        exit 1
+    fi
+fi
+if ! mv "$STAGING" "$FINAL"; then
     echo ""
-    echo "ERROR: could not remove the existing $FINAL (likely a root-owned legacy bundle)."
-    echo "Run the legacy cleanup once, then re-run ./setup.sh:"
-    echo "  sudo launchctl bootout system/com.thermalforge.daemon; sudo rm -rf $FINAL /Library/LaunchDaemons/com.thermalforge.daemon.plist /usr/local/bin/thermalforge"
+    echo "ERROR: failed to move the staged bundle into place; restoring the previous bundle."
+    if [ -e "$BACKUP" ]; then
+        mv "$BACKUP" "$FINAL" || echo "WARNING: could not restore $FINAL from $BACKUP."
+    fi
     exit 1
 fi
-mv "$STAGING" "$FINAL"
+# Move succeeded — the previous bundle is no longer needed.
+if [ -e "$BACKUP" ]; then
+    rm -rf "$BACKUP"
+fi
 
 # Strip quarantine on anything Finder dragged in, then launch.
 xattr -cr "$FINAL"

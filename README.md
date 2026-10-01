@@ -178,9 +178,12 @@ socket (`/var/run/thermalforge.sock`, `root:admin` `0660`) and need **no `sudo`*
 fan with `--fan`, e.g. `thermalforge set 3000 --fan 1`.
 
 A CLI hold (`max` or a `set`) is unsupervised: it survives the app quitting, but it does
-**not** survive a helper restart. When the helper is restarted — a version-mismatch
-auto-recovery, `./setup.sh`, or a crash — it returns the fans to Apple auto, so re-issue
-the command after a restart if you still want the hold.
+**not** survive a graceful helper restart. When the helper is restarted through its
+`.restart` path — a version-mismatch auto-recovery or `./setup.sh` — it returns the fans
+to Apple auto before exiting, so re-issue the command after a restart if you still want
+the hold. A hard crash carries no such guarantee: the fans keep their last setting until
+the menu bar app notices the helper is gone and re-establishes control automatically
+through its recovery path.
 
 Fans settle **near** a commanded target rather than exactly on it, so `status` and the menu bar report an RPM slightly above or below what you set — that's the live tach reading, not an error.
 

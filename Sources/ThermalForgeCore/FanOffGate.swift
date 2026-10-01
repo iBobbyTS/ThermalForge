@@ -38,6 +38,13 @@ public struct FanOffGate {
         self.tickInterval = tickInterval
     }
 
+    /// Forget the cold streak so the next cold episode must re-earn the sustained
+    /// window. Used when the monitor is forced to re-take control after the helper
+    /// recovers (forceReengage).
+    public mutating func reset() {
+        coldTicks = 0
+    }
+
     public enum Action: Equatable {
         /// Peak left the stop band — the curve drives again; the streak resets.
         case resume

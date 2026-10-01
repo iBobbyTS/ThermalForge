@@ -79,6 +79,10 @@ public final class ThermalMonitor {
     /// What was last actually SENT to the fans, for the write deadband.
     private var lastWrittenRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
+    /// One-shot: the next tick must issue a write even if the deadband would
+    /// otherwise suppress it. Armed by forceReengage; cleared after the first
+    /// tick that reaches a write decision.
+    private var forceNextWrite = false
 
     // MARK: - Safety Override
 
@@ -156,11 +160,38 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Force the NEXT tick to unconditionally re-take fan control. Used after the
+    /// helper recovers: it exited through its `.restart` resetAuto path, so the
+    /// fans are back in Apple auto and any app hold the helper recorded is gone.
+    /// The monitor must rebuild both its tracked runtime state and a fresh daemon
+    /// hold. Resets the crash/off state, the speed controller, and the safety and
+    /// fans-off gates (re-engagement then happens naturally on the next tick:
+    /// still-hot re-earns the override through the sustain window; normal temps go
+    /// through the bumpless-takeover branch), and arms a one-shot flag that defeats
+    /// the write deadband so one real setRPM/setMax is issued.
+    public func forceReengage() {
+        queue.async { [self] in
+            fansCurrentlyRunning = false
+            speedController.reset()
+            safetyGate.reset()
+            fanOffGate.reset()
+            // Impossible sentinel: |appliedPct - (-1)| is always greater than the
+            // deadband, so the first tick's write can't be suppressed. tickCurve's
+            // seed block must NOT overwrite this while forceNextWrite is set.
+            lastWrittenRPMPercent = -1
+            forceNextWrite = true
+        }
+    }
+
     // MARK: - Polling
 
     private func tick() {
         guard let status = try? fanControl.status() else { return }
         latestStatus = status
+
+        // Consume a pending forced re-take for this tick (if the status read above
+        // failed we return early, keeping the flag for the next tick).
+        let forceWrite = forceNextWrite
 
         // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
         // so the client monitor and the daemon's floor read the identical value.
@@ -185,6 +216,7 @@ public final class ThermalMonitor {
             fansCurrentlyRunning = true
             speedController.resync(1.0)
             lastWrittenRPMPercent = 1.0
+            forceNextWrite = false   // the forced re-take was satisfied by this setMax
             TFLogger.shared.safety(
                 "Override triggered: \(String(format: "%.1f", maxTemp))°C sustained "
                     + "\(Int(FanProfile.safetySustainSeconds.rounded()))s — fans maxed [\(activeProfile.name)]"
@@ -208,7 +240,8 @@ public final class ThermalMonitor {
             // controller eases fans off max instead of dropping them.
         }
 
-        tickCurve(status: status, peakTemp: maxTemp)
+        tickCurve(status: status, peakTemp: maxTemp, forceWrite: forceWrite)
+        forceNextWrite = false   // spent on this tick (whether or not tickCurve wrote)
 
         // UI update at slower cadence (every 500ms)
         if tickCounter % Self.uiUpdateCadence == 0 {
@@ -282,7 +315,7 @@ public final class ThermalMonitor {
 
     // MARK: - Curve-Based Profiles
 
-    private func tickCurve(status: ThermalStatus, peakTemp: Float) {
+    private func tickCurve(status: ThermalStatus, peakTemp: Float, forceWrite: Bool) {
         let curve = activeProfile.curve
         let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
         let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
@@ -346,7 +379,13 @@ public final class ThermalMonitor {
             let observedPct = status.fans.first.map { Float($0.actualRPM) / maxRPM } ?? 0
             let seed = min(max(observedPct, minRPM / maxRPM), 1)
             speedController.resync(seed)
-            lastWrittenRPMPercent = seed
+            // On a forced re-take, leave lastWrittenRPMPercent at the -1 sentinel
+            // forceReengage set: overwriting it with the seed would exactly cancel
+            // the deadband check below when observed ≈ target, suppressing the one
+            // write that rebuilds the daemon's hold.
+            if !forceWrite {
+                lastWrittenRPMPercent = seed
+            }
         }
 
         // Speed controller — PT1 approach, one step toward the target.
@@ -358,9 +397,10 @@ public final class ThermalMonitor {
             _ = speedController.advance(target: targetPct, dt: tickInterval)
         }
 
-        // Apply if changed meaningfully (threshold scaled for 100ms ticks)
+        // Apply if changed meaningfully (threshold scaled for 100ms ticks). A forced
+        // re-take always writes once, so the deadband can't skip the takeover.
         let appliedPct = speedController.current
-        if abs(appliedPct - lastWrittenRPMPercent) > 0.002 {
+        if forceWrite || abs(appliedPct - lastWrittenRPMPercent) > 0.002 {
             let targetRPM = max(maxRPM * appliedPct, minRPM)
             applyCommand(.setRPM(targetRPM))
 
