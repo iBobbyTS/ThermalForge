@@ -182,8 +182,10 @@ A CLI hold (`max` or a `set`) is unsupervised: it survives the app quitting, but
 `.restart` path — a version-mismatch auto-recovery or `./setup.sh` — it returns the fans
 to Apple auto before exiting, so re-issue the command after a restart if you still want
 the hold. A hard crash carries no such guarantee: the fans keep their last setting until
-the menu bar app notices the helper is gone and re-establishes control automatically
-through its recovery path.
+launchd respawns the helper, at which point the menu bar app notices through its
+heartbeat and re-establishes control automatically through its recovery path — rebuilding
+its hold over the fans' last setting after a crash, or re-taking control from Apple auto
+after a graceful `.restart`.
 
 Fans settle **near** a commanded target rather than exactly on it, so `status` and the menu bar report an RPM slightly above or below what you set — that's the live tach reading, not an error.
 

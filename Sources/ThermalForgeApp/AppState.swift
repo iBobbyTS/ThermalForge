@@ -363,14 +363,17 @@ final class AppState: ObservableObject {
             // During a version-mismatch recovery the helper is deliberately being
             // restarted / re-registered. Skip this tick entirely so the two-miss
             // `daemonUnreachable` debounce can't flap over an intended restart,
-            // and so the recovery owns the polling window.
-            if daemonRecoveryWindow.isActive { return }
+            // and so the recovery owns the polling window. Snapshot `active` and
+            // `generation` in ONE lock acquisition so a recovery beginning between
+            // two reads can't slip a post-begin generation past the gate.
+            let window = daemonRecoveryWindow.snapshot
+            if window.active { return }
 
             // Capture the recovery generation BEFORE the socket I/O below. A tick
             // that began before a recovery window opened can still be in flight when
             // that window starts and ends; re-checking only `isActive` in the
             // completion would miss it. If the generation moved, the result is stale.
-            let recoveryGeneration = daemonRecoveryWindow.currentGeneration
+            let recoveryGeneration = window.generation
 
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
             // liveness and the daemon watchdog reverts after 15s of silence. One
@@ -432,12 +435,30 @@ final class AppState: ObservableObject {
                 if didReadVersion, versionValue != nil {
                     self.beginDaemonRecovery()
                 }
+                // Apply this tick's reachability bookkeeping ONLY if no recovery
+                // owns the window and the generation hasn't moved. A mismatch tick
+                // that just opened a recovery window must not ALSO count as a failed
+                // heartbeat: that stale pre-recovery result would increment
+                // heartbeatFailures / flip daemonUnreachable mid-recovery. Reading
+                // the two fields separately is safe here — begin()/end() run only on
+                // the main actor, so the window can't change under this sync block.
+                guard daemonRecoveryWindow.currentGeneration == recoveryGeneration,
+                      !daemonRecoveryWindow.isActive else { return }
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
                 if hbOK {
                     self.heartbeatFailures = 0
+                    let wasUnreachable = self.daemonUnreachable
                     self.daemonUnreachable = false
+                    if wasUnreachable {
+                        // The helper is back after launchd respawned it (a crash or
+                        // uncommanded exit — KeepAlive). Unlike the `.restart` path,
+                        // a crash runs no resetAuto, so the fans may be left manual
+                        // and the daemon's supervised hold died with the process.
+                        // Rebuild control exactly as version recovery does.
+                        self.reengageAfterHelperRecovery(reason: "respawned after crash")
+                    }
                 } else {
                     self.heartbeatFailures += 1
                     if self.heartbeatFailures >= 2 {
@@ -695,19 +716,7 @@ final class AppState: ObservableObject {
                     self.daemonRecoveryExhausted = false
                     self.heartbeatFailures = 0
                     self.daemonUnreachable = false
-                    if self.externalHold == nil {
-                        // The helper exited through resetAuto, so the fans are back
-                        // in Apple auto and its app hold is gone. Force the next
-                        // monitor tick to re-take control and issue one write that
-                        // rebuilds a fresh supervised hold (the deadband is defeated
-                        // for that tick).
-                        self.monitor?.forceReengage()
-                        TFLogger.shared.info("Helper version recovered — monitor force-re-engaging to rebuild the hold")
-                    } else {
-                        // A CLI hold owns the fans; do not force the app to take
-                        // control back over it.
-                        TFLogger.shared.info("Helper version recovered — CLI hold active; leaving fan control to the CLI")
-                    }
+                    self.reengageAfterHelperRecovery(reason: "version recovered")
                 case .failed(let version):
                     self.daemonVersionMismatch = version
                     self.daemonRecoveryExhausted = true
@@ -715,6 +724,24 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Re-take fan control once the helper is back. Shared by both recovery
+    /// paths: the version-mismatch restart above and a plain crash/KeepAlive
+    /// respawn observed as a heartbeat success. Either way the helper's
+    /// supervised hold did not survive the process, so the monitor must rebuild
+    /// its tracked runtime state and issue one real write to reconstruct a hold
+    /// (`forceReengage` arms that write and defeats the deadband). A CLI hold
+    /// wins — never take control from it. `forceReengage` enqueues on the
+    /// monitor's own queue, so this stays off the heartbeat's critical path.
+    @MainActor
+    private func reengageAfterHelperRecovery(reason: String) {
+        guard externalHold == nil else {
+            TFLogger.shared.info("Helper recovered (\(reason)) — CLI hold active; leaving fan control to the CLI")
+            return
+        }
+        monitor?.forceReengage()
+        TFLogger.shared.info("Helper recovered (\(reason)) — monitor force-re-engaging to rebuild the hold")
     }
 
     /// Re-run the recovery on demand (the mismatch banner's retry action), after
@@ -866,6 +893,18 @@ private final class DaemonRecoveryWindow: @unchecked Sendable {
     var currentGeneration: UInt64 {
         lock.lock(); defer { lock.unlock() }
         return generation
+    }
+
+    /// Atomic `(active, generation)` snapshot so a heartbeat tick can check-and-
+    /// capture under ONE lock acquisition. Reading `isActive` then
+    /// `currentGeneration` separately can straddle a recovery that begins between
+    /// them: the tick sees `active == false`, the recovery then calls `begin()`
+    /// and bumps the generation, and the tick captures the NEW generation — so its
+    /// completion's generation equality check passes and it applies a pre-recovery
+    /// result mid-recovery.
+    var snapshot: (active: Bool, generation: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        return (active, generation)
     }
 
     /// Claim the window; returns false when one is already in progress.

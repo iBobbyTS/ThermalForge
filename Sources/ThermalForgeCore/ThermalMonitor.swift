@@ -80,8 +80,11 @@ public final class ThermalMonitor {
     private var lastWrittenRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
     /// One-shot: the next tick must issue a write even if the deadband would
-    /// otherwise suppress it. Armed by forceReengage; cleared after the first
-    /// tick that reaches a write decision.
+    /// otherwise suppress it. Armed by forceReengage; cleared ONLY when a tick
+    /// actually issues a control write (the safety-engage setMax, a setRPM from
+    /// tickCurve, or a resetAuto that hands the fans back to the system). A tick
+    /// that returns without writing — cold/hands-off/hysteresis, a safety hold, a
+    /// failed status read — leaves it armed so the next tick that CAN write does.
     private var forceNextWrite = false
 
     // MARK: - Safety Override
@@ -189,8 +192,9 @@ public final class ThermalMonitor {
         guard let status = try? fanControl.status() else { return }
         latestStatus = status
 
-        // Consume a pending forced re-take for this tick (if the status read above
-        // failed we return early, keeping the flag for the next tick).
+        // Snapshot a pending forced re-take for this tick. The property itself is
+        // cleared only once this tick issues a real control write (below); a failed
+        // status read above returned before reaching here, keeping it armed.
         let forceWrite = forceNextWrite
 
         // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
@@ -240,8 +244,10 @@ public final class ThermalMonitor {
             // controller eases fans off max instead of dropping them.
         }
 
+        // tickCurve clears forceNextWrite itself, and only at the points where it
+        // actually issues a control write (setRPM or a release resetAuto). Every
+        // early return above leaves the flag armed for the next writable tick.
         tickCurve(status: status, peakTemp: maxTemp, forceWrite: forceWrite)
-        forceNextWrite = false   // spent on this tick (whether or not tickCurve wrote)
 
         // UI update at slower cadence (every 500ms)
         if tickCounter % Self.uiUpdateCadence == 0 {
@@ -328,7 +334,11 @@ public final class ThermalMonitor {
                 speedController.reset()
                 lastWrittenRPMPercent = 0
                 state = .idle
+                // resetAuto is a real control action (fans handed to the system),
+                // so a pending forced re-take is satisfied here.
+                forceNextWrite = false
             }
+            // Not running → nothing to write: keep forceNextWrite armed.
             return
         }
 
@@ -347,6 +357,7 @@ public final class ThermalMonitor {
             // and over (2,182 releases in three days of logs — the sudden
             // 3000+→1300 RPM drops). Until cold is sustained, hold at minimum —
             // the same treatment the hysteresis band gives.
+            // Not running → nothing to write: keep forceNextWrite armed.
             guard fansCurrentlyRunning else { return }
             if offAction == .release {
                 applyCommand(.resetAuto)
@@ -354,6 +365,8 @@ public final class ThermalMonitor {
                 speedController.reset()
                 lastWrittenRPMPercent = 0
                 state = .idle
+                // resetAuto is a real control action (fans handed to the system).
+                forceNextWrite = false
                 TFLogger.shared.fan(
                     "Fans off: \(String(format: "%.1f", peakTemp))°C sustained "
                         + "≤\(Int(curve.stopTemp))°C for \(Int(FanProfile.stopSustainSeconds.rounded()))s "
@@ -403,6 +416,8 @@ public final class ThermalMonitor {
         if forceWrite || abs(appliedPct - lastWrittenRPMPercent) > 0.002 {
             let targetRPM = max(maxRPM * appliedPct, minRPM)
             applyCommand(.setRPM(targetRPM))
+            // A real control write was issued — the forced re-take is satisfied.
+            forceNextWrite = false
 
             if !fansCurrentlyRunning {
                 TFLogger.shared.fan("Fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", peakTemp))°C [\(activeProfile.name)]")

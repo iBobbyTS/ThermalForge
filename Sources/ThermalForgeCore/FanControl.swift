@@ -289,21 +289,30 @@ public final class FanControl {
 
     // MARK: - Reset
 
-    /// Reset all fans to Apple defaults (auto mode, thermalmonitord resumes)
+    /// Reset all fans to Apple defaults (auto mode, thermalmonitord resumes).
+    /// Throws if any fan-mode/restoration write fails: callers that gate a
+    /// dangerous action on a confirmed reset (the daemon's `.restart` shutdown)
+    /// must be able to observe failure rather than proceed on a silent no-op.
     public func resetAuto() throws {
         let count = try fanCount()
 
         for i in 0..<count {
             let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            _ = smc.writeKey(modeKey, bytes: [0])
+            guard smc.writeKey(modeKey, bytes: [0]) else {
+                throw ThermalForgeError.writeFailed(modeKey)
+            }
 
             let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            _ = smc.writeKey(targetKey, bytes: floatToSMCBytes(0))
+            guard smc.writeKey(targetKey, bytes: floatToSMCBytes(0)) else {
+                throw ThermalForgeError.writeFailed(targetKey)
+            }
         }
 
         // Reset Ftst if it exists — thermalmonitord reclaims control
         if hasFtst {
-            _ = smc.writeKey(SMCFanKey.forceTest, bytes: [0])
+            guard smc.writeKey(SMCFanKey.forceTest, bytes: [0]) else {
+                throw ThermalForgeError.writeFailed(SMCFanKey.forceTest)
+            }
         }
         log("Reset to Apple defaults")
     }
