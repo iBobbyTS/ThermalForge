@@ -54,7 +54,7 @@ struct ConnectionServerTests {
 
         let server = ConnectionServer(listenFD: listenFD, maxConnections: 8,
                                       headerDeadline: 1.0, requestDeadline: 5.0) { _ in
-            .versionResponse("served")   // prove the request was actually processed
+            ConnectionReply(.versionResponse("served"))   // prove the request was actually processed
         }
         server.start()
 

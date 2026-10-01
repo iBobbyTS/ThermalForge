@@ -117,6 +117,11 @@ public enum DaemonProtocol {
 public struct DaemonRequest: Codable, Equatable {
     public enum Verb: String, Codable {
         case max, auto, set, setfan, status, state, heartbeat, version
+        /// Ask the helper to exit so launchd (KeepAlive) respawns the freshly
+        /// installed bundle binary. Encoded/decoded like every other verb; a daemon
+        /// that predates the case fails to decode it and answers
+        /// `.unsupported(daemonVersion:)`, which drives the caller's fallback.
+        case restart
     }
 
     /// Protocol version this client speaks.
@@ -228,5 +233,42 @@ public struct DaemonResponse: Codable, Equatable {
     public static func unsupported(daemonVersion: String) -> DaemonResponse {
         .init(ok: false, error: .unsupportedVersion, message: "unsupported protocol version",
               version: daemonVersion)
+    }
+}
+
+// MARK: - Bundle LaunchDaemon plist
+
+/// The LaunchDaemon plist embedded at
+/// `Contents/Library/LaunchDaemons/com.thermalforge.daemon.plist` and registered
+/// with `SMAppService.daemon(plistName:)`. Pure (no I/O) so the bundle assembler
+/// and its tests share one source of truth.
+public enum DaemonBundlePlist {
+    /// Must match the `plistName:` passed to SMAppService.
+    public static let filename = "com.thermalforge.daemon.plist"
+
+    /// Bundle-root-relative path to the embedded helper. `BundleProgram` — not
+    /// `Program`/`ProgramArguments` — is what an SMAppService bundle daemon uses:
+    /// per `man 5 launchd.plist` it is resolved relative to the app bundle root,
+    /// and is only valid for SMAppService-installed jobs. An absolute path or an
+    /// argument vector here would be rejected, so there are deliberately neither.
+    public static let helperRelativePath = "Contents/MacOS/thermalforge-helper"
+
+    public static func contents() -> String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(ThermalForgeDaemon.label)</string>
+            <key>BundleProgram</key>
+            <string>\(helperRelativePath)</string>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+        </dict>
+        </plist>
+        """
     }
 }

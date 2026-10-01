@@ -17,9 +17,17 @@ public enum ThermalForgeDaemon {
     // so path squatting is structurally impossible (unlike world-writable /tmp).
     // Cleared at boot; RunAtLoad re-creates the socket at daemon load.
     public static let socketPath = "/var/run/thermalforge.sock"
-    public static let plistPath = "/Library/LaunchDaemons/com.thermalforge.daemon.plist"
-    public static let installPath = "/usr/local/bin/thermalforge"
     public static let label = "com.thermalforge.daemon"
+
+    /// Umask applied around bind() so the socket is created with its final mode
+    /// atomically — no bind→chmod window in which a different mode is visible.
+    /// A socket file is created 0777 & ~umask, so 0117 yields the intended 0660
+    /// (rw-rw----). Public so a test can assert the mode math without a socket.
+    public static let socketUmask: mode_t = 0o117
+
+    /// The mode bind() yields under `socketUmask`, computed rather than hardcoded
+    /// so the umask and the expected mode can't drift apart.
+    public static let socketMode: mode_t = 0o777 & ~socketUmask
 
     /// Check if the daemon socket exists and accepts connections
     public static var isRunning: Bool {
@@ -39,46 +47,6 @@ public enum ThermalForgeDaemon {
         // unbounded connect here would hang the one command that must always work.
         return connectWithTimeout(fd, &addr, timeout: 2.0)
     }
-
-    /// Whether launchd has our label registered in the system domain. This is
-    /// true even when the job is loaded-but-failing (retry-looping on a dead
-    /// exec) — where `isRunning` is false because the socket never comes up — so
-    /// it's the right question to ask before deciding to boot out. Requires root
-    /// (system domain); the install/uninstall callers already run under sudo.
-    public static var isRegisteredWithLaunchd: Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = ["print", "system/\(label)"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do {
-            try p.run()
-            p.waitUntilExit()
-            return p.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
-    /// Boot out our launchd job, but only if the label is actually registered —
-    /// so a fresh install (nothing loaded) doesn't provoke a spurious
-    /// "Boot-out failed: No such process". If a bootout IS attempted and fails
-    /// for a real reason, it throws rather than swallowing it.
-    public static func bootoutIfRegistered() throws {
-        guard isRegisteredWithLaunchd else { return }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = ["bootout", "system/\(label)"]
-        try p.run()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw ThermalForgeError.writeFailed(
-                "launchctl bootout system/\(label) failed (exit \(p.terminationStatus))"
-            )
-        }
-        Thread.sleep(forTimeInterval: 0.5)   // let launchd settle before re-bootstrap
-    }
 }
 
 // MARK: - Daemon Client
@@ -87,22 +55,22 @@ public enum DaemonError: Error, CustomStringConvertible {
     case notRunning
     case connectionFailed
     case commandFailed(String)
-    /// The running daemon speaks the pre-Phase-2 string protocol (upgrade window:
-    /// `brew upgrade` done, `sudo thermalforge install` not yet). Its socket is up so
-    /// it isn't "not running" — callers must handle this distinctly (reinstall nudge /
-    /// direct-SMC fallback), not mistake it for a transient failure.
+    /// The running helper speaks the pre-Phase-2 string protocol (upgrade window:
+    /// a new app bundle is in place but the old helper is still registered). Its
+    /// socket is up so it isn't "not running" — callers must handle this distinctly
+    /// (reopen guidance / direct-SMC fallback), not mistake it for a transient failure.
     case incompatibleDaemon
 
     public var description: String {
         switch self {
         case .notRunning:
-            return "ThermalForge daemon is not running. Run: sudo thermalforge install"
+            return "ThermalForge helper is not running. Reopen ThermalForge to re-register it, or check System Settings > General > Login Items & Extensions."
         case .connectionFailed:
-            return "Failed to connect to daemon socket"
+            return "Failed to connect to helper socket"
         case .commandFailed(let msg):
             return "Daemon error: \(msg)"
         case .incompatibleDaemon:
-            return "The background daemon is an older build using the previous control protocol. Reinstall to reconnect: sudo thermalforge install"
+            return "The background helper is an older build using the previous control protocol. Reopen ThermalForge to update the embedded helper, or check System Settings > General > Login Items & Extensions."
         }
     }
 }
@@ -180,6 +148,13 @@ public final class DaemonClient {
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
 
+        // R4: a helper that exits (e.g. a `.restart`) between our connect and our
+        // write must produce a FrameError.write, never a SIGPIPE that kills the
+        // caller. This process-wide SIG_IGN is set at each entry point too; this
+        // per-fd option is the guarantee that travels with the socket.
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
         // Bound every send/recv so a hung or contended daemon can never block the
         // caller indefinitely — the v0.1.7 freeze. Healthy round-trips here are
         // sub-millisecond (heartbeat/version/state) to low-single-digit ms; 2s is a
@@ -252,9 +227,6 @@ private enum HoldState {
 public final class DaemonServer {
     private let socketFD: Int32
     private let fanControl: FanControl
-    /// uid of the controlling user (who ran `sudo thermalforge install`). The
-    /// socket is chown'd to this uid + 0600, so only that user (and root) connect.
-    private let ownerUID: uid_t
     /// Serializes all SMC access — prevents data race between client handler and watchdog
     private let smcLock = NSLock()
     /// The current hold and its owner. Re-applied after sleep/wake; the watchdog
@@ -280,26 +252,21 @@ public final class DaemonServer {
     /// Phase 4 connection layer (concurrent bounded accept + framed I/O), created in run().
     private var connectionServer: ConnectionServer?
 
-    public init(fanControl: FanControl, ownerUID: uid_t,
+    /// One-shot guard for `.restart` shutdown. Both the response-write completion
+    /// and the 5s fallback timer can call it; whichever runs first wins, and the
+    /// other becomes a no-op rather than a second `exit`.
+    private let restartLock = NSLock()
+    private var restartScheduled = false
+
+    public init(fanControl: FanControl,
                 sampleMaxTemp: (() -> Float?)? = nil) throws {
         self.fanControl = fanControl
-        self.ownerUID = ownerUID
         // Cache fan RPM limits once (fixed hardware constants). Empty on a read failure
         // → clamp becomes a no-op and FanControl's own range check stays the backstop.
         self.fanLimits = (try? fanControl.status())?.fans
             .map { (Float($0.minRPM), Float($0.maxRPM)) } ?? []
         self.rateLimiter = RateLimiter(now: Date())
         self.injectedSampler = sampleMaxTemp
-
-        // Refuse to start with an unusable owner. uid 0 would make the socket
-        // root-only and silently lock every non-root account (the user's app/CLI)
-        // out of fan control. Fail loudly under KeepAlive so Console.app shows why,
-        // rather than a mystery "daemon-down" banner. Install.run() guarantees a
-        // real uid, so reaching here means a hand-edited plist or a dev mistake.
-        guard ownerUID != 0 else {
-            NSLog("ThermalForge daemon: refusing to start — owner uid is 0. Reinstall with `sudo thermalforge install` from your user account.")
-            throw ThermalForgeError.writeFailed("daemon owner uid must be non-zero")
-        }
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
@@ -315,10 +282,21 @@ public final class DaemonServer {
         addr.sun_family = sa_family_t(AF_UNIX)
         setPath(&addr, ThermalForgeDaemon.socketPath)
 
-        // Bind under a 0077 umask so the socket is 0700-from-birth — the previous
-        // bind→chmod gap (default umask briefly left it world-accessible) never
-        // exists. Restore the process umask immediately after.
-        let oldMask = umask(0o077)
+        // Bind under a 0117 umask so the socket is 0660-from-birth — the previous
+        // bind→chmod gap (default umask briefly left the socket more permissive)
+        // never exists. A socket file is created 0777 & ~umask, so this yields
+        // exactly 0660 (rw-rw----) before any connect can race the chmod below.
+        // Restore the process umask immediately after.
+        //
+        // Owner model (replaces the old chown-to-installing-uid + 0600 model):
+        // the socket is root:admin 0660. Any member of the `admin` group may
+        // connect — group membership already grants sudo-equivalent control, so
+        // this is not a privilege escalation — while non-admin users are denied by
+        // the group bits. root owns the file, so no unprivileged account can
+        // replace or unlink it. This removes the old installer's need to capture
+        // the controlling user's uid and the lockout that followed if that account
+        // changed.
+        let oldMask = umask(ThermalForgeDaemon.socketUmask)
         let bindResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
@@ -330,27 +308,35 @@ public final class DaemonServer {
             throw ThermalForgeError.writeFailed("bind() failed: \(errno)")
         }
 
-        // Hand the socket to the controlling user: owned by them, group wheel,
-        // 0600. Only that user (and root — perms don't bind root) can connect.
-        //
-        // The boundary is the umask(0o077) above — the socket is 0700-from-birth
-        // unconditionally. These two calls are refinement, not the boundary: chown so
-        // the user (not just root) can connect, chmod to trim the meaningless execute
-        // bit on a socket. Neither degrades security if it fails — chown failing
-        // leaves it root-only (fails closed); chmod failing leaves user-owned 0700,
-        // functionally identical to 0600 on a socket. We guard them anyway for
-        // DIAGNOSABILITY: an unchecked failure would surface as a mystery
-        // "daemon-down" banner with no cause. A loud crash-loop under KeepAlive that
-        // puts the errno in Console.app beats a silent lockout.
-        guard chown(ThermalForgeDaemon.socketPath, ownerUID, 0) == 0 else {
+        // Resolve the admin group by NAME — never a hardcoded gid (80 is not
+        // guaranteed across systems/installs). Fail loudly if it can't be found:
+        // proceeding would chown to the wrong group and silently lock every admin
+        // user out of fan control (a mystery "helper-down" banner, no cause).
+        guard let adminGroup = getgrnam("admin") else {
             let err = errno
-            NSLog("ThermalForge daemon: chown of the socket to uid %u failed: errno %d", ownerUID, err)
+            NSLog("ThermalForge daemon: getgrnam(\"admin\") failed: errno %d — cannot set socket group", err)
+            close(fd)
+            throw ThermalForgeError.writeFailed("getgrnam(admin) failed: errno \(err)")
+        }
+        let adminGID = adminGroup.pointee.gr_gid
+
+        // Refinement on top of the 0660-from-birth umask above: chown so the
+        // socket's group is `admin` (rather than the creating process's group) so
+        // admin users can connect, and chmod to make the intended mode explicit.
+        // Neither call is the security boundary; if it fails we still fail closed
+        // (a failed chown leaves the socket root-owned, reachable by root only) and
+        // we guard them for DIAGNOSABILITY — an unchecked failure would surface as a
+        // mystery "helper-down" banner with no cause. A loud crash-loop under
+        // KeepAlive that puts the errno in Console.app beats a silent lockout.
+        guard chown(ThermalForgeDaemon.socketPath, 0, adminGID) == 0 else {
+            let err = errno
+            NSLog("ThermalForge daemon: chown of the socket to root:%u failed: errno %d", adminGID, err)
             close(fd)
             throw ThermalForgeError.writeFailed("chown() failed: errno \(err)")
         }
-        guard chmod(ThermalForgeDaemon.socketPath, 0o600) == 0 else {
+        guard chmod(ThermalForgeDaemon.socketPath, 0o660) == 0 else {
             let err = errno
-            NSLog("ThermalForge daemon: chmod(0600) on the socket failed: errno %d", err)
+            NSLog("ThermalForge daemon: chmod(0660) on the socket failed: errno %d", err)
             close(fd)
             throw ThermalForgeError.writeFailed("chmod() failed: errno \(err)")
         }
@@ -657,17 +643,19 @@ public final class DaemonServer {
 
     // MARK: - Request Processing
 
-    /// Decode a request body → response: the framing/version/log wrapper around the
+    /// Decode a request body → reply: the framing/version/log wrapper around the
     /// atomic process(). smcLock is taken ONLY for the process() call — never around
     /// the I/O, so a slow-reading client can no longer hold it during the write.
-    private func processFrame(_ body: Data) -> DaemonResponse {
+    /// Returns a `ConnectionReply` so a `.restart` can defer shutdown until its
+    /// acknowledgement is actually written (see `scheduleRestartShutdown`).
+    private func processFrame(_ body: Data) -> ConnectionReply {
         guard let request = try? DaemonProtocol.decode(DaemonRequest.self, from: body) else {
             // Undecodable = unknown verb or a shape from a newer client.
-            return .unsupported(daemonVersion: ThermalForgeVersion.current)
+            return ConnectionReply(.unsupported(daemonVersion: ThermalForgeVersion.current))
         }
         // A newer protocol than we speak → tell the client our build so it can react.
         guard request.v <= DaemonProtocol.version else {
-            return .unsupported(daemonVersion: ThermalForgeVersion.current)
+            return ConnectionReply(.unsupported(daemonVersion: ThermalForgeVersion.current))
         }
         smcLock.lock()
         let response = process(request)
@@ -675,7 +663,61 @@ public final class DaemonServer {
         // Verb + outcome only — never raw client bytes.
         NSLog("ThermalForge daemon: verb=%@ outcome=%@", request.verb.rawValue,
               response.ok ? "ok" : (response.error?.rawValue ?? "error"))
-        return response
+
+        // `.restart` replies first; the actual resetAuto + exit is deferred to the
+        // write completion (or the 5s fallback) so the client observes `ok` before
+        // the socket dies.
+        if request.verb == .restart, response.ok {
+            return ConnectionReply(response, onWriteComplete: scheduleRestartShutdown())
+        }
+        return ConnectionReply(response)
+    }
+
+    // MARK: - Restart Shutdown
+
+    /// Arm the `.restart` shutdown: reset the fans to Apple auto, then exit so
+    /// launchd (KeepAlive) respawns the freshly-installed helper from the bundle.
+    ///
+    /// State-loss semantics (deliberate, from the plan): exiting leaves the
+    /// hardware in Apple's auto mode — the safe default — because `resetAuto()` runs
+    /// before `exit(0)`. The app re-establishes its hold after the version recovers
+    /// (it forces one monitor write). A CLI's unsupervised hold ends at the restart
+    /// (a CLI cannot supervise across a process boundary); because we reset to Apple
+    /// auto there is no unattended window of stuck manual RPM, and the thermal floor
+    /// keys off "no hold", which now genuinely means Apple is managing thermals — so
+    /// it correctly skips evaluation.
+    ///
+    /// The returned closure runs after the response write settles (success OR a
+    /// write error from a disconnected client). A 5s timer is the fallback if that
+    /// completion never fires (client vanished before the write could start); the
+    /// one-shot guard makes either path win exactly once.
+    private func scheduleRestartShutdown() -> () -> Void {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            self?.performRestartShutdown()
+        }
+        return { [weak self] in self?.performRestartShutdown() }
+    }
+
+    private func performRestartShutdown() {
+        restartLock.lock()
+        if restartScheduled {
+            restartLock.unlock()
+            return
+        }
+        restartScheduled = true
+        restartLock.unlock()
+
+        smcLock.lock()
+        do {
+            try fanControl.resetAuto()
+        } catch {
+            NSLog("ThermalForge daemon: resetAuto on restart failed: %@", "\(error)")
+        }
+        smcLock.unlock()
+
+        stateLock.lock(); hold = .none; safetySuspended = false; stateLock.unlock()
+        NSLog("ThermalForge daemon: restart requested — fans reset to Apple auto, exiting for launchd respawn")
+        exit(0)
     }
 
     /// The full request dispatch — MOVED VERBATIM from the pre-Phase-4 serial handler.
@@ -786,6 +828,12 @@ public final class DaemonServer {
                 // Reports the build this daemon process is running, so a CLI from a
                 // newer install can detect it's talking to a stale daemon.
                 response = .versionResponse(ThermalForgeVersion.current)
+            case .restart:
+                // The app's self-heal verb when it detects a version mismatch after
+                // an update: acknowledge now, and processFrame defers resetAuto + exit
+                // until this acknowledgement is written. No SMC work happens here —
+                // the shutdown path owns that, so it can't race the reply.
+                response = .ok()
             }
         } catch {
             response = .failure(.internal, "\(error)")

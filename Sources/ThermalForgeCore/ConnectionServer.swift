@@ -13,14 +13,30 @@
 import Darwin
 import Foundation
 
+/// One handled request's outbound reply. `onWriteComplete` (optional) runs exactly
+/// once after the response frame's write attempt settles — either it was written,
+/// or the write failed because the client disconnected. It does NOT run if the
+/// connection is torn down before the write begins (header/full deadline, EOF).
+/// DaemonServer's `.restart` uses it to defer shutdown until the client has been
+/// acknowledged; its 5s fallback timer covers the never-runs case.
+struct ConnectionReply {
+    let response: DaemonResponse
+    let onWriteComplete: (() -> Void)?
+
+    init(_ response: DaemonResponse, onWriteComplete: (() -> Void)? = nil) {
+        self.response = response
+        self.onWriteComplete = onWriteComplete
+    }
+}
+
 final class ConnectionServer: @unchecked Sendable {
     private let listenFD: Int32
     private let maxConnections: Int
     private let headerDeadline: TimeInterval
     private let requestDeadline: TimeInterval
-    /// Processes a decoded request body → response. DaemonServer wraps its call in
+    /// Processes a decoded request body → reply. DaemonServer wraps its call in
     /// smcLock, so it's safe under the concurrent handlers here.
-    private let handle: (Data) -> DaemonResponse
+    private let handle: (Data) -> ConnectionReply
 
     private let acceptQueue = DispatchQueue(label: "com.thermalforge.accept")
     private var acceptSource: DispatchSourceRead?
@@ -31,7 +47,7 @@ final class ConnectionServer: @unchecked Sendable {
          maxConnections: Int = 8,
          headerDeadline: TimeInterval = 1.0,
          requestDeadline: TimeInterval = 5.0,
-         handle: @escaping (Data) -> DaemonResponse) {
+         handle: @escaping (Data) -> ConnectionReply) {
         self.listenFD = listenFD
         self.maxConnections = maxConnections
         self.headerDeadline = headerDeadline
@@ -79,6 +95,12 @@ final class ConnectionServer: @unchecked Sendable {
     /// concurrently. The header deadline closes a connect-and-hang fast (freeing its slot
     /// so a queued request isn't starved); the full deadline bounds a slow/partial body.
     private func handleConnection(_ fd: Int32) {
+        // R4: a client that disconnects mid-reply must make the write fail
+        // observably (the DispatchIO completion below), never kill the daemon with
+        // SIGPIPE. Process-wide SIG_IGN is a backstop; this per-fd option travels
+        // with the accepted socket.
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
         let q = DispatchQueue(label: "com.thermalforge.conn")
         let io = DispatchIO(type: .stream, fileDescriptor: fd, queue: q) { [self] _ in
@@ -118,8 +140,15 @@ final class ConnectionServer: @unchecked Sendable {
                 readExactly(io, length: len, queue: q) { [self] body in
                     guard let body else { finish(); return }
                     autoreleasepool {   // v0.1.10 hygiene, now per request
-                        let response = handle(Data(body))
-                        writeResponse(io, response, queue: q, completion: finish)
+                        let reply = handle(Data(body))
+                        writeResponse(io, reply.response, queue: q) {
+                            // The write attempt has settled — either the frame went
+                            // out or it failed because the client disconnected. Let
+                            // the handler react (e.g. `.restart` shutdown) before the
+                            // connection is closed.
+                            reply.onWriteComplete?()
+                            finish()
+                        }
                     }
                 }
             }
