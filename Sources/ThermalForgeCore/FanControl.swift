@@ -45,6 +45,12 @@ public struct ThermalStatus: Encodable {
     public let fans: [FanStatus]
     public let temperatures: [String: Float]
 
+    /// Memberwise init for non-SMC consumers (UI harnesses, previews, tests).
+    public init(fans: [FanStatus], temperatures: [String: Float]) {
+        self.fans = fans
+        self.temperatures = temperatures
+    }
+
     public struct FanStatus: Encodable {
         public let index: Int
         public let actualRPM: Int
@@ -52,6 +58,16 @@ public struct ThermalStatus: Encodable {
         public let minRPM: Int
         public let maxRPM: Int
         public let mode: String
+
+        public init(index: Int, actualRPM: Int, targetRPM: Int,
+                    minRPM: Int, maxRPM: Int, mode: String) {
+            self.index = index
+            self.actualRPM = actualRPM
+            self.targetRPM = targetRPM
+            self.minRPM = minRPM
+            self.maxRPM = maxRPM
+            self.mode = mode
+        }
     }
 }
 

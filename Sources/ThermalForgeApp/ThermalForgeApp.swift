@@ -9,7 +9,11 @@ import Darwin
 import SwiftUI
 import ThermalForgeCore
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Owns the menu bar item and the popover panel (see StatusBarController).
+    @MainActor private var statusBar: StatusBarController?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // R4: the app can have its helper exit out from under an in-flight socket
         // write (a `.restart`). Without this, that closed peer raises SIGPIPE and
@@ -26,7 +30,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if running.count > 1 {
             TFLogger.shared.error("Another instance already running — quitting")
             NSApp.terminate(nil)
+            return
         }
+
+        let appState = AppState()
+        statusBar = StatusBarController(appState: appState)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -47,58 +55,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct ThermalForgeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @StateObject private var appState = AppState()
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarView()
-                .environmentObject(appState)
-        } label: {
-            MenuBarLabel(
-                state: appState.monitorState,
-                maxTemp: appState.maxTemp,
-                fahrenheit: appState.useFahrenheit,
-                needsDaemonUpdate: appState.daemonVersionMismatch != nil
-            )
-        }
-        .menuBarExtraStyle(.window)
-    }
-}
-
-// MARK: - Menu Bar Label
-
-struct MenuBarLabel: View {
-    let state: MonitorState
-    let maxTemp: Float?
-    var fahrenheit: Bool = false
-    var needsDaemonUpdate: Bool = false
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: iconName)
-                .overlay(alignment: .topTrailing) {
-                    // Small dot when the daemon is out of sync — visible without
-                    // opening the menu, for users who never touch the CLI.
-                    if needsDaemonUpdate {
-                        Circle()
-                            .fill(.orange)
-                            .frame(width: 5, height: 5)
-                            .offset(x: 3, y: -2)
-                    }
-                }
-            if let tempC = maxTemp {
-                let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
-                Text("\(Int(display))°")
-                    .font(.system(.caption, design: .monospaced))
-            }
-        }
-    }
-
-    private var iconName: String {
-        switch state {
-        case .safetyOverride: return "exclamationmark.triangle.fill"
-        case .active: return "fan.fill"
-        case .idle: return "fan"
+        // The menu bar presence lives in AppDelegate (StatusBarController:
+        // NSStatusItem + NSPopover). MenuBarExtra(.window) was replaced because
+        // its panel height grows with content but never shrinks back — a
+        // transient banner (daemon down +137pt) left a permanent dead region
+        // at the bottom of the menu. A bare Settings scene keeps @main valid.
+        Settings {
+            EmptyView()
         }
     }
 }
