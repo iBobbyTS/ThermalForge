@@ -3,11 +3,11 @@
 //  ThermalForge
 //
 //  Client-side speed trajectory, tested hardware-free via the extracted
-//  controller: worst-case span converges inside the 3s deadline (both
-//  directions), steps scale with the remaining error (small corrections are
-//  gentle — the audible-step failure of a 3s-sized linear rate), deceleration
-//  is gentler than acceleration, and a moving target is chased without
-//  overshoot.
+//  controller: worst-case span converges inside its direction's deadline
+//  (5s up, 10s down), steps scale with the remaining error (small
+//  corrections are gentle — the audible-step failure of a linear rate),
+//  deceleration is gentler than acceleration, and a moving target is chased
+//  without overshoot.
 //
 
 import Foundation
@@ -21,30 +21,30 @@ struct FanSpeedControllerTests {
     /// This hardware's fallback fan span: 2317–7826 RPM.
     private static let minPct: Float = 2317.0 / 7826.0
 
-    @Test("worst-case span converges within the 3s deadline — up")
+    @Test("worst-case span converges within the 5s deadline — up")
     func deadlineUp() {
         var c = FanSpeedController()
         c.resync(Self.minPct)
         var ticks = 0
-        while c.current < 1.0 && ticks < 60 {
+        while c.current < 1.0 && ticks < 70 {
             _ = c.advance(target: 1.0, dt: 0.1)
             ticks += 1
         }
         #expect(c.current == 1.0)                       // snapped exactly
-        #expect(Float(ticks) * 0.1 <= 3.0, "took \(ticks) ticks")
+        #expect(Float(ticks) * 0.1 <= 5.0, "took \(ticks) ticks")
     }
 
-    @Test("worst-case span converges within the 3s deadline — down")
+    @Test("worst-case span converges within the 10s deadline — down")
     func deadlineDown() {
         var c = FanSpeedController()
         c.resync(1.0)
         var ticks = 0
-        while c.current > Self.minPct && ticks < 60 {
+        while c.current > Self.minPct && ticks < 120 {
             _ = c.advance(target: Self.minPct, dt: 0.1)
             ticks += 1
         }
         #expect(c.current == Self.minPct)               // snapped exactly
-        #expect(Float(ticks) * 0.1 <= 3.0, "took \(ticks) ticks")
+        #expect(Float(ticks) * 0.1 <= 10.0, "took \(ticks) ticks")
     }
 
     @Test("steps are proportional to the remaining error")
@@ -66,10 +66,10 @@ struct FanSpeedControllerTests {
         var down = FanSpeedController()
         down.resync(1.0)
         var upTicks = 0, downTicks = 0
-        while up.current < 1.0 && upTicks < 60 {
+        while up.current < 1.0 && upTicks < 200 {
             _ = up.advance(target: 1.0, dt: 0.1); upTicks += 1
         }
-        while down.current > 0.0 && downTicks < 60 {
+        while down.current > 0.0 && downTicks < 200 {
             _ = down.advance(target: 0.0, dt: 0.1); downTicks += 1
         }
         #expect(downTicks > upTicks)
@@ -118,10 +118,12 @@ struct FanSpeedControllerTests {
         #expect(c.tauUp == FanProfile.speedTauUpSeconds)
         #expect(c.tauDown == FanProfile.speedTauDownSeconds)
         #expect(c.snap == FanProfile.speedSnapFraction)
-        // tau <= 3 / ln(err0 / snap) with err0 = worst real span.
+        // tau <= deadline / ln(err0 / snap) with err0 = worst real span;
+        // the deadlines are per direction: 5s up, 10s down.
         let err0 = 1.0 - Self.minPct
-        let bound = 3.0 / log(err0 / FanProfile.speedSnapFraction)
-        #expect(FanProfile.speedTauUpSeconds <= bound)
-        #expect(FanProfile.speedTauDownSeconds <= bound)
+        let upBound = 5.0 / log(err0 / FanProfile.speedSnapFraction)
+        let downBound = 10.0 / log(err0 / FanProfile.speedSnapFraction)
+        #expect(FanProfile.speedTauUpSeconds <= upBound)
+        #expect(FanProfile.speedTauDownSeconds <= downBound)
     }
 }

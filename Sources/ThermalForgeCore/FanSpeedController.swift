@@ -16,18 +16,19 @@
 //  it replaced:
 //
 //  1. Deadline by construction. tau is sized so the worst-case span (min→max
-//     RPM) converges inside the snap band within 3 seconds: tau <= 3 / ln(err0
-//     / snap). With err0 ~ 0.70 and snap 0.01 that is tau <= 0.71s.
+//     RPM) converges inside the snap band within the direction's deadline:
+//     5 seconds up, 10 seconds down — tau <= deadline / ln(err0 / snap).
+//     With err0 ~ 0.70 and snap 0.01 that is tau <= 1.18 up / 2.35 down.
 //  2. Steps proportional to error. A temperature spike that moves the target
 //     far commands a fast approach; a 1°C drift nudging the target a few
 //     percent moves the fans a few percent — no audible RPM steps on small
-//     corrections, which a 3s-sized linear rate (>= 0.23/s) cannot avoid.
+//     corrections, which a 5s-sized linear rate (>= 0.14/s) cannot avoid.
 //  3. Unconditionally stable on a moving target. The target is recomputed
 //     every tick as temperature moves; a first-order chase is a low-pass on
 //     the target signal — no overshoot, no tuning conditions.
 //
 //  Asymmetric taus keep the old governors' acoustic intent (faster up for
-//  thermal safety, gentler down), both still inside the 3s deadline.
+//  thermal safety, gentler down), each inside its own deadline.
 //
 
 import Foundation

@@ -80,6 +80,11 @@ public final class ThermalMonitor {
 
     // MARK: - Fan State
 
+    /// Low-pass on the raw peak temperature before it reaches the curve
+    /// target — asymmetric (fast heating, damped cooling). The safety gate
+    /// and anomaly detection bypass it and see the raw value. See
+    /// TemperatureFilter.
+    private var tempFilter = TemperatureFilter()
     /// Owns the current-speed trajectory toward each tick's curve target
     /// (PT1 exponential approach). See FanSpeedController.
     private var speedController = FanSpeedController()
@@ -210,7 +215,12 @@ public final class ThermalMonitor {
 
         // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
         // so the client monitor and the daemon's floor read the identical value.
+        // Two consumers, two signals: the safety override and anomaly detection
+        // take the RAW value (those layers must not be lagged by a filter); the
+        // curve layer takes it low-passed, so idle-core ±5°C oscillation and
+        // sensor cliffs can't chatter the RPM target on a 100ms scale.
         let maxTemp = status.safetyPeakTemp
+        let curveTemp = tempFilter.update(raw: maxTemp, dt: tickInterval)
 
         // Monitor cadence: process capture + anomaly detection (every 2 seconds)
         if tickCounter % Self.monitorCadence == 0 {
@@ -258,7 +268,7 @@ public final class ThermalMonitor {
         // tickCurve clears forceNextWrite itself, and only at the points where it
         // actually issues a control write (setRPM or a release resetAuto). Every
         // early return above leaves the flag armed for the next writable tick.
-        tickCurve(status: status, peakTemp: maxTemp, forceWrite: forceWrite)
+        tickCurve(status: status, curveTemp: curveTemp, forceWrite: forceWrite)
 
         // UI update at slower cadence (1s; immediate on visible change)
         if pushGate.shouldPush(tick: tickCounter, profileID: activeProfile.id, state: state) {
@@ -331,7 +341,10 @@ public final class ThermalMonitor {
 
     // MARK: - Curve-Based Profiles
 
-    private func tickCurve(status: ThermalStatus, peakTemp: Float, forceWrite: Bool) {
+    /// - Parameter curveTemp: the FILTERED peak temperature (see
+    ///   TemperatureFilter) — everything the curve layer decides on, the
+    ///   fans-off gate included, must see the same smoothed signal.
+    private func tickCurve(status: ThermalStatus, curveTemp: Float, forceWrite: Bool) {
         let curve = activeProfile.curve
         let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
         let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
@@ -364,20 +377,21 @@ public final class ThermalMonitor {
         }
 
         // Fans-off gate — evaluated EVERY tick (like the safety gate) so its
-        // cold streak resets the moment the peak leaves the stop band.
-        let offAction = fanOffGate.evaluate(temp: peakTemp, stopTemp: curve.stopTemp)
+        // cold streak resets the moment the filtered peak leaves the stop band.
+        let offAction = fanOffGate.evaluate(temp: curveTemp, stopTemp: curve.stopTemp)
 
         // Get target from curve (now applies curve shape: easeIn, linear, easeOut, sCurve)
-        let curveTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning)
+        let curveTarget = curve.targetPercent(at: curveTemp, fansCurrentlyRunning: fansCurrentlyRunning)
 
         if curveTarget == nil {
             // Curve says fans should be off — but the release is CONFIRMED, not
             // instant: an idle core's sensor reading falls off a cliff when its
-            // workload ends, swinging the peak across stopTemp on a 100ms scale.
-            // An instant release there handed the fans to Apple mid-ramp over
-            // and over (2,182 releases in three days of logs — the sudden
-            // 3000+→1300 RPM drops). Until cold is sustained, hold at minimum —
-            // the same treatment the hysteresis band gives.
+            // workload ends, swinging the peak across stopTemp on a 100ms scale
+            // (the filter's cooling tau damps the cliff, and this sustain window
+            // confirms it). An instant release there handed the fans to Apple
+            // mid-ramp over and over (2,182 releases in three days of logs —
+            // the sudden 3000+→1300 RPM drops). Until cold is sustained, hold
+            // at minimum — the same treatment the hysteresis band gives.
             guard fansCurrentlyRunning else {
                 // Forced re-engage reconciliation. A helper crash can leave the
                 // hardware in manual mode while forceReengage set
@@ -402,7 +416,7 @@ public final class ThermalMonitor {
                 // resetAuto is a real control action (fans handed to the system).
                 forceNextWrite = false
                 TFLogger.shared.fan(
-                    "Fans off: \(String(format: "%.1f", peakTemp))°C sustained "
+                    "Fans off: \(String(format: "%.1f", curveTemp))°C sustained "
                         + "≤\(Int(curve.stopTemp))°C for \(Int(FanProfile.stopSustainSeconds.rounded()))s "
                         + "[\(activeProfile.name)]"
                 )
@@ -444,17 +458,17 @@ public final class ThermalMonitor {
             _ = speedController.advance(target: targetPct, dt: tickInterval)
         }
 
-        // Apply if changed meaningfully (threshold scaled for 100ms ticks). A forced
+        // Apply if changed meaningfully (speedWriteDeadband of max RPM). A forced
         // re-take always writes once, so the deadband can't skip the takeover.
         let appliedPct = speedController.current
-        if forceWrite || abs(appliedPct - lastWrittenRPMPercent) > 0.002 {
+        if forceWrite || abs(appliedPct - lastWrittenRPMPercent) > FanProfile.speedWriteDeadband {
             let targetRPM = max(maxRPM * appliedPct, minRPM)
             applyCommand(.setRPM(targetRPM))
             // A real control write was issued — the forced re-take is satisfied.
             forceNextWrite = false
 
             if !fansCurrentlyRunning {
-                TFLogger.shared.fan("Fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", peakTemp))°C [\(activeProfile.name)]")
+                TFLogger.shared.fan("Fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", curveTemp))°C [\(activeProfile.name)]")
             }
 
             lastWrittenRPMPercent = appliedPct

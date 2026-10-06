@@ -231,17 +231,42 @@ extension FanProfile {
 
 extension FanProfile {
     /// PT1 approach time-constant, target ABOVE current (seconds). See
-    /// FanSpeedController for the algorithm; the taus are sized from the 3s
-    /// convergence deadline: tau <= 3 / ln(err0 / snap). Worst real span is
-    /// min→max RPM (≈0.296→1.0 on this hardware, err0 ≈ 0.70), so with snap
-    /// 0.01 the bound is tau <= 0.71 — 0.55 leaves margin (~2.4s worst case).
-    public static let speedTauUpSeconds: Float = 0.55
-    /// Same, target BELOW current. Slightly larger than up: the old governors'
-    /// acoustic intent (gentle deceleration) kept, still ~2.8s worst case.
-    public static let speedTauDownSeconds: Float = 0.65
+    /// FanSpeedController for the algorithm; the taus are sized from the
+    /// convergence deadlines: tau <= deadline / ln(err0 / snap). Worst real
+    /// span is min→max RPM (≈0.296→1.0 on this hardware, err0 ≈ 0.70), so
+    /// with snap 0.01 the up bound (5s deadline) is tau <= 1.18 — 1.15
+    /// leaves margin (~4.9s worst case).
+    public static let speedTauUpSeconds: Float = 1.15
+    /// Same, target BELOW current, 10s deadline → tau <= 2.35. Roughly double
+    /// the up-constant: acoustically a deceleration should be the gentler
+    /// direction, and a workload's end is exactly when sudden RPM drops are
+    /// most audible. 2.30 lands ~9.8s worst case.
+    public static let speedTauDownSeconds: Float = 2.3
     /// Land exactly on the target once within this fraction of max RPM —
     /// makes "reached target" exact instead of asymptotic.
     public static let speedSnapFraction: Float = 0.01
+    /// Minimum change in applied percent that triggers an SMC write. Sized
+    /// for the slow taus: a step at the snap edge is a few thousandths of
+    /// full RPM, and writing every one of those would make the tail of a
+    /// ramp a stream of inaudible-but-constant SMC writes. 0.005 of max RPM
+    /// (~39 RPM on this hardware) stays far below audibility.
+    public static let speedWriteDeadband: Float = 0.005
+}
+
+// MARK: - Temperature Filter
+
+extension FanProfile {
+    /// Curve-input low-pass time-constant, heating direction (seconds). The
+    /// curve target must track real load changes promptly — the speed
+    /// controller is the acoustic brake, not this filter. 1.0s cuts an
+    /// idle-ish ±5°C P-core oscillation (~2s period) to ~30% while adding
+    /// under a second of lag to genuine warming. See TemperatureFilter.
+    public static let tempFilterTauUpSeconds: Float = 1.0
+    /// Same, cooling direction. Idle-core sensor cliffs (20-30°C in
+    /// milliseconds when a workload ends) must not yank the curve target
+    /// down mid-ramp. 6.0s shrinks a 2s-period swing to ~5%; genuine cooling
+    /// (tens of seconds of thermal mass) passes almost unattenuated.
+    public static let tempFilterTauDownSeconds: Float = 6.0
 }
 
 // MARK: - Safety
