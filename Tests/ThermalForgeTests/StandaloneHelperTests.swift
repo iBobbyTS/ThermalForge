@@ -18,16 +18,20 @@ import Testing
 struct StandaloneHelperTests {
 
     /// A connected pair of Unix stream fds, for the real writeFrame/readFrame path.
-    private func socketPair() -> (Int32, Int32) {
+    /// Throws on failure: a failed socketpair leaves fds at [0, 0], and fd 0 is
+    /// stdin (see DaemonProtocolTests.socketPair for the failure this caused).
+    private func socketPair() throws -> (Int32, Int32) {
         var fds = [Int32](repeating: 0, count: 2)
         let rc = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
-        #expect(rc == 0)
+        guard rc == 0 else {
+            throw DaemonError.connectionFailed
+        }
         return (fds[0], fds[1])
     }
 
     /// Round-trip a value: encode → writeFrame(a) → readFrame(b) → decode.
     private func roundTrip<T: Codable & Equatable>(_ value: T, max: Int) throws -> T {
-        let (a, b) = socketPair()
+        let (a, b) = try socketPair()
         defer { close(a); close(b) }
         let frame = try DaemonProtocol.encodeFrame(value, max: max)
         try DaemonProtocol.writeFrame(a, frame)

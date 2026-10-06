@@ -19,16 +19,22 @@ import Testing
 struct DaemonProtocolTests {
 
     /// A connected pair of Unix stream fds, for the real writeFrame/readFrame path.
-    private func socketPair() -> (Int32, Int32) {
+    /// Throws on failure: a failed socketpair leaves fds at [0, 0], and fd 0 is
+    /// stdin — under parallel execution a transient fd-pressure failure would
+    /// otherwise write a frame to stdin, surface as a misleading "errno 32
+    /// Broken pipe", and close stdin for the rest of the run.
+    private func socketPair() throws -> (Int32, Int32) {
         var fds = [Int32](repeating: 0, count: 2)
         let rc = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
-        #expect(rc == 0)
+        guard rc == 0 else {
+            throw DaemonError.connectionFailed
+        }
         return (fds[0], fds[1])
     }
 
     /// Round-trip a value: encode → writeFrame(a) → readFrame(b) → decode.
     private func roundTrip<T: Codable & Equatable>(_ value: T, max: Int) throws -> T {
-        let (a, b) = socketPair()
+        let (a, b) = try socketPair()
         defer { close(a); close(b) }
         let frame = try DaemonProtocol.encodeFrame(value, max: max)
         try DaemonProtocol.writeFrame(a, frame)
@@ -105,7 +111,7 @@ struct DaemonProtocolTests {
             _ = try DaemonProtocol.encodeFrame(DaemonRequest(verb: .version), max: 1)
         }
         // Read side: a length prefix over the cap is rejected before the body is read.
-        let (a, b) = socketPair()
+        let (a, b) = try socketPair()
         defer { close(a); close(b) }
         let header: [UInt8] = [0x00, 0x00, 0x13, 0x88]   // 5000 > 4096; top byte 0x00 → hostile/binary
         try DaemonProtocol.writeFrame(a, header)
@@ -118,7 +124,7 @@ struct DaemonProtocolTests {
     func legacyPeerDetected() throws {
         // A pre-Phase-2 peer's raw reply — first byte is ASCII 'e' (0x65). The bytes
         // as a big-endian length far exceed the cap, but the ASCII lead marks it legacy.
-        let (a, b) = socketPair()
+        let (a, b) = try socketPair()
         defer { close(a); close(b) }
         try DaemonProtocol.writeFrame(a, Array("error: unknown command 'x'\n".utf8))
         #expect(throws: DaemonProtocol.FrameError.legacyPeer) {
@@ -126,7 +132,7 @@ struct DaemonProtocolTests {
         }
 
         // A genuinely binary over-cap length (non-ASCII top byte) stays hostile.
-        let (c, d) = socketPair()
+        let (c, d) = try socketPair()
         defer { close(c); close(d) }
         try DaemonProtocol.writeFrame(c, [0xFF, 0x00, 0x00, 0x00])
         #expect(throws: DaemonProtocol.FrameError.oversized) {
@@ -144,8 +150,11 @@ struct DaemonProtocolTests {
 
     @Test("clean EOF mid-frame reads as closed, not as a timeout")
     func eofClassified() throws {
-        let (a, b) = socketPair()
-        defer { close(a); close(b) }
+        // Each fd has exactly ONE closer: under parallel execution a double
+        // close (explicit + defer) races the fd number being reused by another
+        // suite's socketpair and closes somebody else's socket.
+        let (a, b) = try socketPair()
+        defer { close(b) }
         // A truncated header followed by a clean close: the first read delivers
         // the partial bytes, the next returns 0 → `.closed`.
         try DaemonProtocol.writeFrame(a, [0x00, 0x00])
@@ -157,7 +166,7 @@ struct DaemonProtocolTests {
 
     @Test("a silent-but-alive peer reads as readTimeout under SO_RCVTIMEO")
     func readTimeoutClassified() throws {
-        let (a, b) = socketPair()
+        let (a, b) = try socketPair()
         defer { close(a); close(b) }
         // Nothing is ever written; the bounded wait expires → `.readTimeout`.
         // Generous 300ms so a loaded CI machine can't flake it into a pass-by-luck.
@@ -170,10 +179,13 @@ struct DaemonProtocolTests {
 
     @Test("writing to a closed peer fails with the errno attached")
     func writeFailureCarriesErrno() throws {
+        var previous = sigaction()
+        sigaction(SIGPIPE, nil, &previous)
         signal(SIGPIPE, SIG_IGN)   // the failure must surface as an error, not kill the test
-        let (a, b) = socketPair()
-        defer { close(a); close(b) }
-        close(b)
+        defer { sigaction(SIGPIPE, &previous, nil) }   // process-wide — restore for parallel suites
+        let (a, b) = try socketPair()
+        defer { close(a) }
+        close(b)   // single closer per fd — see eofClassified
         do {
             try DaemonProtocol.writeFrame(a, [0x00, 0x00, 0x00, 0x04, 0x7B, 0x7D])
             Issue.record("expected writeFrame to fail against a closed peer")
