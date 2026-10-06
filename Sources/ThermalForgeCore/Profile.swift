@@ -155,7 +155,7 @@ extension FanProfile {
         id: "balanced",
         name: "Balanced",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 70,
-                     maxRPMPercent: 0.60, curveShape: .easeIn)
+                     maxRPMPercent: 1.0, curveShape: .easeIn)
     )
 
     /// Performance: linear curve, fast response. Thermals over noise.
@@ -163,7 +163,7 @@ extension FanProfile {
         id: "performance",
         name: "Performance",
         curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 65,
-                     maxRPMPercent: 0.85, curveShape: .linear)
+                     maxRPMPercent: 1.0, curveShape: .linear)
     )
 
     /// Max: fans pinned at 100%, no temperature conditions. Selecting it means

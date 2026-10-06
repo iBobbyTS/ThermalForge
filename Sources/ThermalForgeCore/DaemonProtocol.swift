@@ -21,11 +21,29 @@ public enum DaemonProtocol {
     public static let maxRequestBytes = 4 * 1024
     public static let maxResponseBytes = 64 * 1024
 
-    public enum FrameError: Error, Equatable {
+    public enum FrameError: Error, Equatable, CustomStringConvertible {
         case oversized    // declared length exceeds the cap (genuine over-cap / hostile binary)
         case legacyPeer   // the peer is speaking the pre-Phase-2 string protocol
-        case closed       // EOF / read error / timeout before the frame completed
-        case write        // write error / timeout
+        case closed       // clean EOF mid-frame: the peer closed the connection
+        case readTimeout  // SO_RCVTIMEO expired before the frame completed — peer alive but slow
+        case readFailed(Int32)   // read(2) error other than the timeout; errno attached
+        case writeTimeout // SO_SNDTIMEO expired mid-write
+        case writeFailed(Int32)  // write(2) error (incl. EPIPE); errno attached
+
+        /// `"\(error)"` must self-identify: these strings land verbatim in
+        /// "Fan command failed: … — <description>", and telling a slow-peer
+        /// timeout from a dead-peer close after the fact is the whole point.
+        public var description: String {
+            switch self {
+            case .oversized: return "oversized"
+            case .legacyPeer: return "legacyPeer"
+            case .closed: return "closed (peer closed connection)"
+            case .readTimeout: return "readTimeout (SO_RCVTIMEO)"
+            case .readFailed(let e): return "readFailed (errno \(e): \(String(cString: strerror(e))))"
+            case .writeTimeout: return "writeTimeout (SO_SNDTIMEO)"
+            case .writeFailed(let e): return "writeFailed (errno \(e): \(String(cString: strerror(e))))"
+            }
+        }
     }
 
     // MARK: - Framing (4-byte big-endian length prefix + JSON body)
@@ -86,7 +104,15 @@ public enum DaemonProtocol {
             let n = bytes.withUnsafeBytes { p in
                 Darwin.write(fd, p.baseAddress!.advanced(by: sent), bytes.count - sent)
             }
-            guard n > 0 else { throw FrameError.write }   // 0 or -1 (incl. SO_SNDTIMEO)
+            guard n > 0 else {
+                // -1: EAGAIN is the SO_SNDTIMEO expiry (EWOULDBLOCK == EAGAIN on
+                // Darwin); anything else is a real write error with errno carried
+                // out for the log. n == 0 never happens for a stream write but is
+                // guarded with errno anyway.
+                let e = errno
+                if e == EAGAIN { throw FrameError.writeTimeout }
+                throw FrameError.writeFailed(e)
+            }
             sent += n
         }
     }
@@ -96,8 +122,12 @@ public enum DaemonProtocol {
         try JSONDecoder().decode(type, from: data)
     }
 
-    /// Read exactly `count` bytes, looping on partial reads; throws `.closed` if the
-    /// peer closes or the bounded read times out (SO_RCVTIMEO) before they all arrive.
+    /// Read exactly `count` bytes, looping on partial reads. The three failure
+    /// modes stay distinguishable — the 2026-10-04 investigation could not tell
+    /// a slow-but-alive peer from a dead one because all of them surfaced as
+    /// `.closed`: clean EOF (peer closed), SO_RCVTIMEO expiry (peer alive but
+    /// too slow to answer within the caller's budget), and any other read(2)
+    /// error with its errno.
     private static func readFully(_ fd: Int32, _ count: Int) throws -> [UInt8] {
         var buf = [UInt8](repeating: 0, count: count)
         var got = 0
@@ -105,7 +135,12 @@ public enum DaemonProtocol {
             let n = buf.withUnsafeMutableBytes { p in
                 Darwin.read(fd, p.baseAddress!.advanced(by: got), count - got)
             }
-            guard n > 0 else { throw FrameError.closed }   // 0 = EOF, -1 = error/timeout
+            if n == 0 { throw FrameError.closed }   // clean EOF: peer closed mid-frame
+            guard n > 0 else {
+                let e = errno
+                if e == EAGAIN { throw FrameError.readTimeout }
+                throw FrameError.readFailed(e)
+            }
             got += n
         }
         return buf

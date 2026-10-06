@@ -160,8 +160,8 @@ public final class DaemonClient {
         defer { close(fd) }
 
         // R4: a helper that exits (e.g. a `.restart`) between our connect and our
-        // write must produce a FrameError.write, never a SIGPIPE that kills the
-        // caller. This process-wide SIG_IGN is set at each entry point too; this
+        // write must produce a FrameError write failure, never a SIGPIPE that
+        // kills the caller. This process-wide SIG_IGN is set at each entry point too; this
         // per-fd option is the guarantee that travels with the socket.
         var noSigPipe: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))

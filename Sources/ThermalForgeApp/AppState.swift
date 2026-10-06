@@ -397,9 +397,19 @@ final class AppState: ObservableObject {
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
             // liveness and the daemon watchdog reverts after 15s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
-            // for the next tick.
-            let firstBeat = (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
-            let hbOK = firstBeat || ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true)
+            // for the next tick. The failure REASON is captured (not swallowed by
+            // try?) — "readTimeout (SO_RCVTIMEO)" vs "closed (peer closed
+            // connection)" is the load-vs-crash discriminator for the
+            // unreachable→restart cascade, and it only surfaces on a miss, so a
+            // healthy daemon logs nothing.
+            func beat() -> (ok: Bool, error: String?) {
+                do { return (try client.request(DaemonRequest(verb: .heartbeat)).ok, nil) }
+                catch { return (false, String(describing: error)) }
+            }
+            let firstBeat = beat()
+            let retryBeat = firstBeat.ok ? nil : beat()
+            let hbOK = firstBeat.ok || (retryBeat?.ok ?? false)
+            let hbError = firstBeat.ok ? nil : (retryBeat?.error ?? firstBeat.error)
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
             // the last known value untouched rather than clearing the banner on a
@@ -505,6 +515,12 @@ final class AppState: ObservableObject {
                     }
                 } else {
                     self.heartbeatFailures += 1
+                    // The miss reason rides along: readTimeout ⇒ helper alive but
+                    // starved under load; closed/notRunning ⇒ helper exited or is
+                    // mid-restart. Without this the cascade below starts blind.
+                    TFLogger.shared.info(
+                        "Heartbeat miss #\(self.heartbeatFailures): \(hbError ?? "unknown error")"
+                    )
                     if self.heartbeatFailures >= 2 {
                         let becameUnreachable = !self.daemonUnreachable
                         self.daemonUnreachable = true

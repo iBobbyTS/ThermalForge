@@ -61,8 +61,8 @@ Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for
 | Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Behavior |
 |---|---|---|---|---|---|---|
 | **Silent (Apple Default)** | N/A | N/A | N/A | Apple | N/A | Monitoring only. Apple controls fans. |
-| **Balanced** | 50°C | 55°C | 70°C | 60% | Ease-in (pos²) | Quiet at low temps, ramps harder as heat builds. |
-| **Performance** | 50°C | 55°C | 65°C | 85% | Linear | Direct proportional response. |
+| **Balanced** | 50°C | 55°C | 70°C | 100% | Ease-in (pos²) | Quiet at low temps, ramps harder as heat builds. |
+| **Performance** | 50°C | 55°C | 65°C | 100% | Linear | Direct proportional response. |
 | **Max** | N/A | N/A | N/A | 100% | Always on | Fans pinned at 100% until you switch profiles or press Default. |
 
 **How profiles work:**
@@ -70,8 +70,8 @@ Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for
 - **50°C–start (hysteresis zone):** Fans maintain current state. Already running → stay at minimum. Already off → stay off. (Does not apply to Max.)
 - **Above start:** Fans engage immediately. Balanced and Performance ramp proportionally using their curve shape.
 - **Max:** No temperature conditions — fans pin at 100% immediately (within one 100ms tick) and stay there until you switch profiles or press Default.
-- **Between start and ceiling:** Fan speed scales based on the profile's curve shape. Balanced (ease-in) is quiet at low temps — at 62.5°C (midpoint of 55–70°C), fans run at only 15% of max RPM instead of 30% linear. Performance (linear) is proportional.
-- **At ceiling and above:** Fan speed at the profile's maximum (60%/85%).
+- **Between start and ceiling:** Fan speed scales based on the profile's curve shape. Balanced (ease-in) is quiet at low temps — at 62.5°C (midpoint of 55–70°C), fans run at only 25% of max RPM instead of 50% linear. Performance (linear) is proportional.
+- **At ceiling and above:** Fans at 100% of max RPM.
 - **Speed changes:** One shared PT1 controller for every profile — exponential approach (τ 0.55s up / 0.65s down), any target reached within ~3s; handing control back to Apple (Default, sustained-cold fans-off) is always immediate, with no glide.
 - **0 to minimum RPM is binary:** Apple Silicon MacBook fans cannot spin below their minimum RPM (2317 on M5 Max, 1200 on M1 Max). When a profile engages, fans jump directly to minimum — a hardware limitation of brushless DC motors that require a startup burst to overcome static friction. Above minimum, all speed changes are smooth, mediated by the shared speed controller.
 

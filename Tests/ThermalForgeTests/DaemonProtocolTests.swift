@@ -133,4 +133,73 @@ struct DaemonProtocolTests {
             _ = try DaemonProtocol.readFrame(d, max: DaemonProtocol.maxResponseBytes)
         }
     }
+
+    // MARK: - Read/write failure classification (2026-10-04 observability fix)
+    //
+    // A frame failure must self-identify: a peer that is alive but too slow to
+    // answer (SO_RCVTIMEO) is a different operational situation from a peer that
+    // closed the connection (exit / restart), and both differ from a raw read
+    // error. Before this they all surfaced as `.closed` and the distinction had
+    // to be reconstructed by hand from timestamps.
+
+    @Test("clean EOF mid-frame reads as closed, not as a timeout")
+    func eofClassified() throws {
+        let (a, b) = socketPair()
+        defer { close(a); close(b) }
+        // A truncated header followed by a clean close: the first read delivers
+        // the partial bytes, the next returns 0 → `.closed`.
+        try DaemonProtocol.writeFrame(a, [0x00, 0x00])
+        close(a)
+        #expect(throws: DaemonProtocol.FrameError.closed) {
+            _ = try DaemonProtocol.readFrame(b, max: DaemonProtocol.maxRequestBytes)
+        }
+    }
+
+    @Test("a silent-but-alive peer reads as readTimeout under SO_RCVTIMEO")
+    func readTimeoutClassified() throws {
+        let (a, b) = socketPair()
+        defer { close(a); close(b) }
+        // Nothing is ever written; the bounded wait expires → `.readTimeout`.
+        // Generous 300ms so a loaded CI machine can't flake it into a pass-by-luck.
+        var tv = timeval(tv_sec: 0, tv_usec: 300_000)
+        setsockopt(b, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        #expect(throws: DaemonProtocol.FrameError.readTimeout) {
+            _ = try DaemonProtocol.readFrame(b, max: DaemonProtocol.maxRequestBytes)
+        }
+    }
+
+    @Test("writing to a closed peer fails with the errno attached")
+    func writeFailureCarriesErrno() throws {
+        signal(SIGPIPE, SIG_IGN)   // the failure must surface as an error, not kill the test
+        let (a, b) = socketPair()
+        defer { close(a); close(b) }
+        close(b)
+        do {
+            try DaemonProtocol.writeFrame(a, [0x00, 0x00, 0x00, 0x04, 0x7B, 0x7D])
+            Issue.record("expected writeFrame to fail against a closed peer")
+        } catch let error as DaemonProtocol.FrameError {
+            // EPIPE (32) is the expected carrier; accept any classified write
+            // failure shape so the assertion survives platform quirks, but
+            // require the errno to be a real system error number.
+            guard case .writeFailed(let e) = error else {
+                if case .writeTimeout = error {
+                    Issue.record("SO_SNDTIMEO fired on a closed-peer write; expected EPIPE")
+                }
+                return
+            }
+            #expect(e == EPIPE)
+        }
+    }
+
+    @Test("frame error descriptions distinguish the failure modes")
+    func errorDescriptionsSelfIdentify() {
+        // `"\(error)"` is what the "Fan command failed: … — <error>" log line
+        // prints, so the strings themselves are the observability contract.
+        let closed = DaemonProtocol.FrameError.closed
+        let timeout = DaemonProtocol.FrameError.readTimeout
+        #expect(String(describing: closed).contains("closed"))
+        #expect(!String(describing: closed).contains("Timeout"))
+        #expect(String(describing: timeout).contains("readTimeout"))
+        #expect(String(describing: DaemonProtocol.FrameError.readFailed(35)).contains("35"))
+    }
 }
