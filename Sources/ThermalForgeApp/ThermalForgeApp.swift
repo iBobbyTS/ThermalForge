@@ -13,6 +13,11 @@ import ThermalForgeCore
 class AppDelegate: NSObject, NSApplicationDelegate {
     /// Owns the menu bar item and the popover panel (see StatusBarController).
     @MainActor private var statusBar: StatusBarController?
+    /// Held so applicationWillTerminate can quiesce it — as a launch-local it
+    /// was unreachable at quit time, which is exactly how the 2026-10-06 race
+    /// happened: the exit resetAuto ran while the monitor's pipeline still had
+    /// an in-flight write, which landed one second later and re-pinned the fans.
+    @MainActor private var appState: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // R4: the app can have its helper exit out from under an in-flight socket
@@ -34,10 +39,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let appState = AppState()
+        self.appState = appState
         statusBar = StatusBarController(appState: appState)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Quiesce FIRST: stop the monitor's ticks, reject new submits, and
+        // drain the pump — otherwise an in-flight ramp write can land at the
+        // daemon AFTER the resetAuto below and re-pin the fans in manual
+        // (observed 2026-10-06: one setRPM arrived 1s after the exit reset
+        // and held max until the daemon watchdog reverted 33s later).
+        appState?.prepareForTermination()
+
         // Reset fans on quit so the daemon doesn't hold stale APP settings — but
         // ONLY if the app owns the hold. A CLI hold (`thermalforge max`) is the
         // user's deliberate, unsupervised choice; quitting the menu bar app must not
