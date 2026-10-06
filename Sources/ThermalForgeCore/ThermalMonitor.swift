@@ -65,11 +65,18 @@ public final class ThermalMonitor {
     /// At 100ms thermal tick, 20 × 0.1s = 2 seconds.
     private static let monitorCadence = 20
 
-    /// UI update cadence: onUpdate fires every N thermal ticks.
-    /// At 100ms thermal tick, 5 × 0.1s = 500ms — smooth UI without excessive redraws.
-    private static let uiUpdateCadence = 5
+    /// UI update cadence: onUpdate fires at most every N thermal ticks,
+    /// plus immediately on a visible change (profile/state) via StatusPushGate.
+    /// At 100ms thermal tick, 10 × 0.1s = 1 second — the menu bar re-renders
+    /// on every push (MenuBarExtra view-graph + NSStatusItem snapshot), and a
+    /// faster cadence spends most of an open menu's lifetime mid-rebuild,
+    /// which can eat picker taps (see StatusPushGate).
+    private static let uiUpdateCadence = 10
 
     private var tickCounter = 0
+
+    /// Decides when onUpdate pushes: 1s cadence, immediate on visible change.
+    private var pushGate = StatusPushGate(intervalTicks: uiUpdateCadence)
 
     // MARK: - Fan State
 
@@ -102,8 +109,11 @@ public final class ThermalMonitor {
 
     // MARK: - Anomaly Detection
 
-    /// Tracks temps over 30 seconds (15 readings at 2s monitor cadence)
-    private var anomalyHistory: [Float] = []
+    /// Two-tier spike/drop detector (2s and 30s windows) with a 60s report
+    /// cooldown — P-core peaks oscillate ±5°C at idle-ish load, and the old
+    /// cooldown-less detector logged an event every few seconds all day.
+    /// See AnomalyGate.
+    private var anomalyGate = AnomalyGate()
 
     // MARK: - Process Buffer
 
@@ -112,7 +122,8 @@ public final class ThermalMonitor {
     private var processBuffer: [(timestamp: String, processes: String)] = []
     private let isoFormatter = ISO8601DateFormatter()
 
-    /// Called on UI update cadence (every 500ms) with updated status
+    /// Called at the UI update cadence (every 1s) and immediately on a visible
+    /// change (profile switch, safety state transition) with updated status
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
@@ -228,7 +239,7 @@ public final class ThermalMonitor {
         }
 
         if safetyAction == .engage || safetyAction == .hold {
-            if tickCounter % Self.uiUpdateCadence == 0 {
+            if pushGate.shouldPush(tick: tickCounter, profileID: activeProfile.id, state: state) {
                 onUpdate?(status, activeProfile, state)
             }
             tickCounter += 1
@@ -249,8 +260,8 @@ public final class ThermalMonitor {
         // early return above leaves the flag armed for the next writable tick.
         tickCurve(status: status, peakTemp: maxTemp, forceWrite: forceWrite)
 
-        // UI update at slower cadence (every 500ms)
-        if tickCounter % Self.uiUpdateCadence == 0 {
+        // UI update at slower cadence (1s; immediate on visible change)
+        if pushGate.shouldPush(tick: tickCounter, profileID: activeProfile.id, state: state) {
             onUpdate?(status, activeProfile, state)
         }
 
@@ -268,55 +279,54 @@ public final class ThermalMonitor {
         processBuffer.append((timestamp: ts, processes: currentProcs))
         if processBuffer.count > 15 { processBuffer.removeFirst() }
 
-        // Anomaly detection: two tiers
-        // Tier 1: instant spike — >5°C between consecutive readings (2 seconds)
-        // Tier 2: sustained change — >10°C over 30 seconds
-        var spikeDetected = false
-
-        // Tier 1: check against previous reading
-        if let prevTemp = anomalyHistory.last {
-            let instantDelta = maxTemp - prevTemp
-            if abs(instantDelta) > 5 {
-                let direction = instantDelta > 0 ? "spike" : "drop"
-                let fan0 = status.fans.first
-                TFLogger.shared.info(
-                    "Instant \(direction): \(String(format: "%.1f", prevTemp))→\(String(format: "%.1f", maxTemp))°C " +
-                    "(\(String(format: "%+.1f", instantDelta))°C in 2s) | " +
-                    "Fan0: \(fan0?.actualRPM ?? 0) RPM (\(fan0?.mode ?? "?")) | " +
-                    "Profile: \(activeProfile.name)"
-                )
-                spikeDetected = true
-            }
+        // Anomaly detection: two tiers, decided by the pure AnomalyGate
+        // (Tier 1: >5°C between 2s readings; Tier 2: >10°C over 30s; both
+        // rate-limited by its 60s report cooldown).
+        func report(_ tier: String, _ window: String, from: Float, to: Float) {
+            let delta = to - from
+            let direction = delta > 0 ? "spike" : "drop"
+            let fan0 = status.fans.first
+            TFLogger.shared.info(
+                "\(tier) \(direction): \(String(format: "%.1f", from))→\(String(format: "%.1f", to))°C " +
+                "(\(String(format: "%+.1f", delta))°C in \(window)) | " +
+                "Fan0: \(fan0?.actualRPM ?? 0) RPM (\(fan0?.mode ?? "?")) | " +
+                "Profile: \(activeProfile.name)"
+            )
         }
 
-        // Tier 2: check over 30-second window
-        if anomalyHistory.count >= 15 {
-            let oldest = anomalyHistory.first!
-            let sustainedDelta = maxTemp - oldest
-            if abs(sustainedDelta) > 10 {
-                let direction = sustainedDelta > 0 ? "spike" : "drop"
-                let fan0 = status.fans.first
-                TFLogger.shared.info(
-                    "Sustained \(direction): \(String(format: "%.1f", oldest))→\(String(format: "%.1f", maxTemp))°C " +
-                    "(\(String(format: "%+.1f", sustainedDelta))°C in 30s) | " +
-                    "Fan0: \(fan0?.actualRPM ?? 0) RPM (\(fan0?.mode ?? "?")) | " +
-                    "Profile: \(activeProfile.name)"
-                )
-                spikeDetected = true
-                anomalyHistory.removeAll()
-            }
+        switch anomalyGate.evaluate(temp: maxTemp) {
+        case .instant(let from, let to):
+            report("Instant", "2s", from: from, to: to)
+            dumpProcessHistory()
+        case .sustained(let from, let to):
+            report("Sustained", "30s", from: from, to: to)
+            dumpProcessHistory()
+        case .none:
+            break
         }
+    }
 
-        // Dump the rolling buffer on any spike — shows what was running BEFORE
-        if spikeDetected {
-            TFLogger.shared.info("Pre-spike process history (last \(processBuffer.count * 2)s):")
-            for entry in processBuffer {
+    /// Dump the rolling buffer on a reported event — shows what was running
+    /// BEFORE it. Consecutive identical snapshots collapse to one line: an
+    /// idle stretch used to cost 15 "  ts: idle" lines per event, which at
+    /// one event every few seconds swamped the daily log (~200k lines/day).
+    private func dumpProcessHistory() {
+        TFLogger.shared.info("Pre-spike process history (last \(processBuffer.count * 2)s):")
+        var idx = 0
+        while idx < processBuffer.count {
+            let entry = processBuffer[idx]
+            var run = 1
+            while idx + run < processBuffer.count, processBuffer[idx + run].processes == entry.processes {
+                run += 1
+            }
+            if run == 1 {
                 TFLogger.shared.info("  \(entry.timestamp): \(entry.processes)")
+            } else {
+                let last = processBuffer[idx + run - 1].timestamp
+                TFLogger.shared.info("  \(entry.timestamp) → \(last): \(entry.processes) (×\(run))")
             }
+            idx += run
         }
-
-        anomalyHistory.append(maxTemp)
-        if anomalyHistory.count > 15 { anomalyHistory.removeFirst() }
     }
 
     // MARK: - Curve-Based Profiles
