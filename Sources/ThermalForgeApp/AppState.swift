@@ -68,8 +68,9 @@ final class AppState: ObservableObject {
     private var monitor: ThermalMonitor?
     private let executor = PrivilegedExecutor()
     private var heartbeatTimer: DispatchSourceTimer?
-    /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
-    private var heartbeatFailures = 0
+    /// Consecutive missed heartbeats, classified hard/soft, for debouncing
+    /// `daemonUnreachable`. See HeartbeatTally for the two thresholds.
+    private var heartbeatTally = HeartbeatTally()
     /// Last time the heartbeat's hold-lost reconciliation fired a re-engage.
     /// Rate-limits it to one per `lossReengageInterval` so a re-engage whose own
     /// write keeps failing can't thrash the monitor on every 5s beat.
@@ -395,21 +396,26 @@ final class AppState: ObservableObject {
             let recoveryGeneration = window.generation
 
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
-            // liveness and the daemon watchdog reverts after 15s of silence. One
+            // liveness and the daemon watchdog reverts after 30s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
             // for the next tick. The failure REASON is captured (not swallowed by
-            // try?) — "readTimeout (SO_RCVTIMEO)" vs "closed (peer closed
-            // connection)" is the load-vs-crash discriminator for the
-            // unreachable→restart cascade, and it only surfaces on a miss, so a
-            // healthy daemon logs nothing.
-            func beat() -> (ok: Bool, error: String?) {
-                do { return (try client.request(DaemonRequest(verb: .heartbeat)).ok, nil) }
-                catch { return (false, String(describing: error)) }
+            // try?) and classified via HeartbeatTally — "soft" timeouts mean the
+            // helper is alive but starved under load and must NOT be restarted on
+            // the fast two-miss fuse (that restart manufactured the 2026-10-05
+            // control gap); hard misses (process gone / connection broken) keep
+            // the old fast recovery.
+            func beat() -> (ok: Bool, kind: HeartbeatMissKind?, error: String?) {
+                do {
+                    return (try client.request(DaemonRequest(verb: .heartbeat)).ok, nil, nil)
+                } catch {
+                    return (false, HeartbeatMissKind.classify(error), String(describing: error))
+                }
             }
             let firstBeat = beat()
             let retryBeat = firstBeat.ok ? nil : beat()
             let hbOK = firstBeat.ok || (retryBeat?.ok ?? false)
             let hbError = firstBeat.ok ? nil : (retryBeat?.error ?? firstBeat.error)
+            let hbKind = firstBeat.ok ? nil : (retryBeat?.kind ?? firstBeat.kind)
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
             // the last known value untouched rather than clearing the banner on a
@@ -472,17 +478,18 @@ final class AppState: ObservableObject {
                 // Apply this tick's reachability bookkeeping ONLY if no recovery
                 // owns the window and the generation hasn't moved. A mismatch tick
                 // that just opened a recovery window must not ALSO count as a failed
-                // heartbeat: that stale pre-recovery result would increment
-                // heartbeatFailures / flip daemonUnreachable mid-recovery. Reading
+                // heartbeat: that stale pre-recovery result would advance the tally
+                // / flip daemonUnreachable mid-recovery. Reading
                 // the two fields separately is safe here — begin()/end() run only on
                 // the main actor, so the window can't change under this sync block.
                 guard daemonRecoveryWindow.currentGeneration == recoveryGeneration,
                       !daemonRecoveryWindow.isActive else { return }
                 // Daemon reachability — debounced so a single blip doesn't flash the
-                // "fan control unavailable" banner. Two consecutive missed heartbeats
-                // (~10s) is a real outage; any success clears it immediately.
+                // "fan control unavailable" banner. Hard misses trip after 2 beats
+                // (~10s); soft (starved-helper) misses only after 4 — see
+                // HeartbeatTally. Any success clears the tally immediately.
                 if hbOK {
-                    self.heartbeatFailures = 0
+                    self.heartbeatTally.reset()
                     let wasUnreachable = self.daemonUnreachable
                     self.daemonUnreachable = false
                     if wasUnreachable {
@@ -514,14 +521,18 @@ final class AppState: ObservableObject {
                         }
                     }
                 } else {
-                    self.heartbeatFailures += 1
-                    // The miss reason rides along: readTimeout ⇒ helper alive but
-                    // starved under load; closed/notRunning ⇒ helper exited or is
-                    // mid-restart. Without this the cascade below starts blind.
+                    // Classify and tally before acting: soft (timeout) misses
+                    // accumulate a longer fuse (4 beats) because a starved-but-
+                    // alive helper must not be restarted; hard misses keep the
+                    // old two-beat recovery. Only a tripped tally may start the
+                    // unreachable cascade below.
+                    let kind = hbKind ?? .hard
+                    let tripped = self.heartbeatTally.record(kind)
+                    let count = kind == .hard ? self.heartbeatTally.hardMisses : self.heartbeatTally.softMisses
                     TFLogger.shared.info(
-                        "Heartbeat miss #\(self.heartbeatFailures): \(hbError ?? "unknown error")"
+                        "Heartbeat miss (\(kind == .hard ? "hard" : "soft")) x\(count): \(hbError ?? "unknown error")"
                     )
-                    if self.heartbeatFailures >= 2 {
+                    if tripped {
                         let becameUnreachable = !self.daemonUnreachable
                         self.daemonUnreachable = true
                         // The socket can go quiet because the helper's SMAppService
@@ -783,7 +794,7 @@ final class AppState: ObservableObject {
                 case .recovered:
                     self.daemonVersionMismatch = nil
                     self.daemonRecoveryExhausted = false
-                    self.heartbeatFailures = 0
+                    self.heartbeatTally.reset()
                     self.daemonUnreachable = false
                     self.reengageAfterHelperRecovery(reason: "version recovered")
                 case .failed(let version):

@@ -154,7 +154,11 @@ public final class DaemonClient {
     /// frames, no string protocol. Runs over the SAME bounded socket code as before
     /// (the v0.1.7 freeze fix): non-blocking `connectWithTimeout` plus
     /// SO_RCVTIMEO/SO_SNDTIMEO, so a wedged daemon can never block the caller.
-    public func request(_ req: DaemonRequest, timeout: TimeInterval = 2.0) throws -> DaemonResponse {
+    /// The 5s budget (was 2s) comes from the 2026-10-05 load test: under sustained
+    /// full CPU load a healthy helper's replies can exceed 2s (15+ timeouts in one
+    /// run, every one misread as a dead helper). 5s absorbs starved-but-alive
+    /// replies; the worst case (a heartbeat's beat + immediate retry) stays ~10s.
+    public func request(_ req: DaemonRequest, timeout: TimeInterval = 5.0) throws -> DaemonResponse {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
@@ -168,8 +172,9 @@ public final class DaemonClient {
 
         // Bound every send/recv so a hung or contended daemon can never block the
         // caller indefinitely — the v0.1.7 freeze. Healthy round-trips here are
-        // sub-millisecond (heartbeat/version/state) to low-single-digit ms; 2s is a
-        // stall cutoff with wide margin over the heaviest real reply.
+        // sub-millisecond (heartbeat/version/state) to low-single-digit ms, but a
+        // fully-loaded machine can starve a healthy helper past 2s (measured,
+        // 2026-10-05); 5s is the stall cutoff that separates "contended" from "wedged".
         let whole = Int(timeout)
         var tv = timeval(tv_sec: whole, tv_usec: Int32((timeout - Double(whole)) * 1_000_000))
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -367,7 +372,8 @@ public final class DaemonServer {
         registerWakeNotification()
 
         // Heartbeat watchdog: if app set fans to manual but hasn't checked in
-        // for 15 seconds, reset to auto. Prevents fans stuck after app crash.
+        // for supervisedHoldSilence (30s), reset to auto. Prevents fans stuck
+        // after app crash.
         startHeartbeatWatchdog()
 
         // Thermal safety floor: overrides a below-max hold toward max when a critical
@@ -388,6 +394,16 @@ public final class DaemonServer {
 
     // MARK: - Heartbeat Watchdog
 
+    /// A supervised hold is reverted to Apple auto after this much heartbeat
+    /// silence. 15s was the pre-load-test value: under sustained full CPU load
+    /// the app's heartbeats can stall past 15s while the app is still alive,
+    /// and the revert dropped a live hold mid-heat (2026-10-05). 30s tolerates
+    /// the app's soft-miss window (HeartbeatTally: 4 beats ≈ 20s+) so a
+    /// starved-but-alive app keeps its hold; a crashed app's fans revert half
+    /// a minute later, with the thermal floor still pinning max when the
+    /// machine is genuinely hot (safetySuspended defers the revert).
+    private static let supervisedHoldSilence: TimeInterval = 30
+
     private func startHeartbeatWatchdog() {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
@@ -405,7 +421,7 @@ public final class DaemonServer {
                 // v0.1.5 fix: the app's heartbeat can no longer drag a CLI hold
                 // into the supervised branch.
                 guard case .supervised(_, let lastBeat) = current,
-                      Date().timeIntervalSince(lastBeat) > 15 else { continue }
+                      Date().timeIntervalSince(lastBeat) > Self.supervisedHoldSilence else { continue }
 
                 // If the thermal floor is holding fans at max (overheating), do NOT
                 // resetAuto — dropping fans while hot is the unsafe move. The app is
