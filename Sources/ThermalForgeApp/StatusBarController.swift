@@ -41,7 +41,12 @@ final class StatusBarController: NSObject {
         if let button = statusItem.button {
             button.target = self
             button.action = #selector(togglePopover(_:))
-            button.imagePosition = .imageLeading
+            button.imagePosition = .noImage
+            // The title is a two-line block (temp over RPM) — the status-bar
+            // cell defaults to single-line and would clamp it.
+            button.cell?.usesSingleLineMode = false
+            button.cell?.truncatesLastVisibleLine = false
+            button.cell?.wraps = true
 
             mismatchDot.wantsLayer = true
             mismatchDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
@@ -75,27 +80,42 @@ final class StatusBarController: NSObject {
     private func refreshButton() {
         guard let button = statusItem.button else { return }
 
-        let symbolName: String
-        switch appState.monitorState {
-        case .safetyOverride: symbolName = "exclamationmark.triangle.fill"
-        case .active: symbolName = "fan.fill"
-        case .idle: symbolName = "fan"
-        }
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        // No icon: the two-line readout IS the button. The monitor state's
+        // only remaining menu-bar cue is the orange temp line during a safety
+        // override (the icon that used to carry it is gone); the popover's
+        // stateIndicator keeps the full detail.
+        button.image = nil
 
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium),
+            .paragraphStyle: paragraph
+        ]
+
+        let title = NSMutableAttributedString(string: "", attributes: attributes)
         if let tempC = appState.maxTemp {
-            let display = appState.useFahrenheit ? tempC * 9 / 5 + 32 : tempC
-            button.title = "\(Int(display))°"
-        } else {
-            button.title = ""
+            let fahrenheit = appState.useFahrenheit
+            let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
+            var tempAttrs = attributes
+            if case .safetyOverride = appState.monitorState {
+                tempAttrs[.foregroundColor] = NSColor.systemOrange
+            }
+            title.append(NSAttributedString(
+                string: "\(Int(display))°\(fahrenheit ? "F" : "C")\n",
+                attributes: tempAttrs
+            ))
+            if let rpm = appState.latestStatus?.fans.first?.actualRPM {
+                title.append(NSAttributedString(string: "\(rpm)", attributes: attributes))
+            }
         }
+        button.attributedTitle = title
 
-        // The dot sits just past the icon+title block's top-right corner.
-        let iconWidth = button.cell?.image?.size.width ?? 0
+        // The dot sits just past the title block's top-right corner.
         let titleWidth = button.attributedTitle.size().width
         mismatchDot.isHidden = (appState.daemonVersionMismatch == nil)
         mismatchDot.frame.origin = NSPoint(
-            x: min(iconWidth + titleWidth + 3, button.bounds.maxX - 5),
+            x: min(titleWidth + 3, button.bounds.maxX - 5),
             y: button.bounds.maxY - 7
         )
     }
