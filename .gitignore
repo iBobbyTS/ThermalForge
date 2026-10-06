@@ -10,3 +10,6 @@ ThermalForge.iconset/
 # AI Agent
 .codegraph
 .agent-work
+
+# IDE
+.vscode

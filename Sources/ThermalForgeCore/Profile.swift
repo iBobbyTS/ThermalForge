@@ -150,19 +150,22 @@ extension FanProfile {
     )
 
     /// Balanced: gentle ease-in curve for everyday use.
-    /// Quiet at low temps (pos²), ramps harder as heat builds.
+    /// Quiet at low temps (pos²), ramps harder as heat builds. Full speed
+    /// only near the safety zone — 90°C, not 70: everyday loads should ride
+    /// the curve, not hit its ceiling.
     public static let balanced = FanProfile(
         id: "balanced",
         name: "Balanced",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 70,
+        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 90,
                      maxRPMPercent: 1.0, curveShape: .easeIn)
     )
 
-    /// Performance: linear curve, fast response. Thermals over noise.
+    /// Performance: linear curve, fast response. Thermals over noise —
+    /// engages at 45°C and is at full speed by 70°C.
     public static let performance = FanProfile(
         id: "performance",
         name: "Performance",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 65,
+        curve: Curve(stopTemp: 40, startTemp: 45, ceilingTemp: 70,
                      maxRPMPercent: 1.0, curveShape: .linear)
     )
 

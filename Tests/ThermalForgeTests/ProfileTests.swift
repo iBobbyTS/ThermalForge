@@ -35,21 +35,21 @@ struct ProfileTests {
         #expect(FanProfile.silent.curve.handsOff == true)
         #expect(FanProfile.silent.name == "Silent (Apple Default)")
 
-        // All active profiles share 50°C off threshold
+        // Off thresholds keep the 5°C hysteresis drop below each start
         #expect(FanProfile.balanced.curve.stopTemp == 50)
-        #expect(FanProfile.performance.curve.stopTemp == 50)
+        #expect(FanProfile.performance.curve.stopTemp == 40)
         #expect(FanProfile.max.curve.stopTemp == 50)
 
-        // Balanced: 50-55-70°C, 100% at ceiling, ease-in
+        // Balanced: 50-55-90°C, 100% at ceiling, ease-in
         #expect(FanProfile.balanced.curve.startTemp == 55)
-        #expect(FanProfile.balanced.curve.ceilingTemp == 70)
+        #expect(FanProfile.balanced.curve.ceilingTemp == 90)
         #expect(FanProfile.balanced.curve.maxRPMPercent == 1.0)
         #expect(FanProfile.balanced.curve.curveShape == .easeIn)
         #expect(FanProfile.balanced.curve.instantEngage == false)
 
-        // Performance: 50-55-65°C, 100% at ceiling, linear
-        #expect(FanProfile.performance.curve.startTemp == 55)
-        #expect(FanProfile.performance.curve.ceilingTemp == 65)
+        // Performance: 40-45-70°C, 100% at ceiling, linear
+        #expect(FanProfile.performance.curve.startTemp == 45)
+        #expect(FanProfile.performance.curve.ceilingTemp == 70)
         #expect(FanProfile.performance.curve.maxRPMPercent == 1.0)
         #expect(FanProfile.performance.curve.curveShape == .linear)
         #expect(FanProfile.performance.curve.instantEngage == false)
@@ -127,12 +127,12 @@ struct ProfileTests {
         #expect(atStart != nil)
         #expect(atStart! >= 0)
 
-        // At ceiling (70°C): should be at maxRPMPercent regardless of shape
-        let atCeiling = curve.targetPercent(at: 70, fansCurrentlyRunning: true)
+        // At ceiling (90°C): should be at maxRPMPercent regardless of shape
+        let atCeiling = curve.targetPercent(at: 90, fansCurrentlyRunning: true)
         #expect(atCeiling == 1.0)
 
-        // Midpoint (62.5°C): position = 0.5, easeIn = 0.25, target = 0.25 * 1.0 = 0.25
-        let atMid = curve.targetPercent(at: 62.5, fansCurrentlyRunning: true)
+        // Midpoint (72.5°C): position = 0.5, easeIn = 0.25, target = 0.25 * 1.0 = 0.25
+        let atMid = curve.targetPercent(at: 72.5, fansCurrentlyRunning: true)
         #expect(atMid != nil)
         #expect(abs(atMid! - 0.25) < 0.001)
 
@@ -144,11 +144,11 @@ struct ProfileTests {
     func performanceLinear() {
         let curve = FanProfile.performance.curve
 
-        // At ceiling (65°C): 100%
-        #expect(curve.targetPercent(at: 65, fansCurrentlyRunning: true) == 1.0)
+        // At ceiling (70°C): 100%
+        #expect(curve.targetPercent(at: 70, fansCurrentlyRunning: true) == 1.0)
 
-        // Midpoint (60°C): position = 0.5, linear = 0.5, target = 0.5 * 1.0 = 0.5
-        let atMid = curve.targetPercent(at: 60, fansCurrentlyRunning: true)
+        // Midpoint (57.5°C): position = 0.5, linear = 0.5, target = 0.5 * 1.0 = 0.5
+        let atMid = curve.targetPercent(at: 57.5, fansCurrentlyRunning: true)
         #expect(atMid != nil)
         #expect(abs(atMid! - 0.5) < 0.001)
     }
