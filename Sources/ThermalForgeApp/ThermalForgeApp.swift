@@ -5,8 +5,8 @@
 //  Menu bar app for fan control on Apple Silicon MacBooks.
 //
 
+import AppKit
 import Darwin
-import SwiftUI
 import ThermalForgeCore
 
 @MainActor
@@ -65,18 +65,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Pure AppKit entry point — no SwiftUI App shell. A shell requires at least
+/// one Scene, and the placeholder `Settings { EmptyView() }` that kept @main
+/// valid registered a "Settings…" menu item (⌘,) that opened a blank window
+/// whenever the popover made this accessory app's menu bar active. The only
+/// UI is the status item + popover; MenuBarView stays SwiftUI via the
+/// NSHostingController inside StatusBarController. `main()` never returns —
+/// NSApplication.run() blocks until quit — so the local `delegate` stays
+/// alive for the app's lifetime alongside NSApplication's unretained delegate.
+@MainActor
 @main
-struct ThermalForgeApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-
-    var body: some Scene {
-        // The menu bar presence lives in AppDelegate (StatusBarController:
-        // NSStatusItem + NSPopover). MenuBarExtra(.window) was replaced because
-        // its panel height grows with content but never shrinks back — a
-        // transient banner (daemon down +137pt) left a permanent dead region
-        // at the bottom of the menu. A bare Settings scene keeps @main valid.
-        Settings {
-            EmptyView()
-        }
+enum ThermalForgeAppMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
     }
 }

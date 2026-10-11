@@ -726,7 +726,10 @@ final class AppState: ObservableObject {
                 // here, on the daemon-confirmed success path, never on a failed reset.
                 self.persistSelectedProfile(FanProfile.silent.id)
                 self.monitor?.switchProfile(.silent)
-                self.monitor?.resetFanState()
+                // No resetFanState — arm the handback watch instead, so a late
+                // ramp write that re-pins the fans after this reset still gets
+                // corrected (see selectProfile for the race).
+                self.monitor?.armHandbackWatch()
                 TFLogger.shared.profile("Reset to Default (Silent (Apple Default))")
             }
         }
@@ -745,9 +748,20 @@ final class AppState: ObservableObject {
         // on the pump (never coalesced/reordered).
         if profile.curve.handsOff || took {
             commandPump.submit(.resetAuto)
-            // resetAuto hands the fans back to the system — the monitor's
-            // running/last-applied tracker must forget its state too.
-            monitor?.resetFanState()
+            // Going hands-off: no resetFanState — instead arm a bounded handback
+            // watch. A ramp write already in flight when the profile switched
+            // can land at the daemon AFTER this resetAuto and re-pin the fans
+            // in manual (the 2026-10-10 race); the monitor re-sends resetAuto
+            // until the HARDWARE confirms auto. Clearing fansCurrentlyRunning
+            // here would disarm exactly that (that's how the race survived the
+            // 2026-10-06 quit fix).
+            // Taking a CLI hold over into an ACTIVE profile: forget the
+            // trajectory so the next tick re-seeds bumplessly from observed RPM.
+            if profile.curve.handsOff {
+                monitor?.armHandbackWatch()
+            } else {
+                monitor?.resetFanState()
+            }
         }
     }
 

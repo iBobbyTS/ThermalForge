@@ -48,9 +48,14 @@ public enum MonitorState: Equatable {
 // MARK: - Thermal Monitor
 
 public final class ThermalMonitor {
-    private let fanControl: FanControl
     private var timer: DispatchSourceTimer?
-    private let queue = DispatchQueue(label: "com.thermalforge.monitor")
+    /// Internal so tests can join this queue as a barrier — profile switches
+    /// are queued here async, and a tick driven synchronously from a test
+    /// thread must not interleave with them.
+    let queue = DispatchQueue(label: "com.thermalforge.monitor")
+    /// The monitor's ONLY hardware dependency is reading status. Injected so
+    /// tests drive ticks with a scripted status instead of real SMC.
+    private let readStatus: () throws -> ThermalStatus
 
     public private(set) var activeProfile: FanProfile
     public private(set) var state: MonitorState = .idle
@@ -73,6 +78,12 @@ public final class ThermalMonitor {
     /// which can eat picker taps (see StatusPushGate).
     private static let uiUpdateCadence = 10
 
+    /// Hands-off handback retry cadence: while the hardware still reads manual
+    /// under a hands-off profile, resetAuto is retried at 1 Hz rather than on
+    /// every 100ms tick — a healthy handback confirms on the next tick, and a
+    /// dead daemon must not be hammered.
+    static let handsOffRetryCadence = 10
+
     private var tickCounter = 0
 
     /// Decides when onUpdate pushes: 1s cadence, immediate on visible change.
@@ -91,6 +102,11 @@ public final class ThermalMonitor {
     /// What was last actually SENT to the fans, for the write deadband.
     private var lastWrittenRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
+    /// Ticks remaining in an armed handback watch (see armHandbackWatch).
+    /// Counted down by the hands-off branch each tick, regardless of outcome —
+    /// only expiry ends the watch, so a late re-pin AFTER a confirmed auto is
+    /// still corrected inside the window.
+    private var handbackTicksLeft = 0
     /// One-shot: the next tick must issue a write even if the deadband would
     /// otherwise suppress it. Armed by forceReengage; cleared ONLY when a tick
     /// actually issues a control write (the safety-engage setMax, a setRPM from
@@ -133,10 +149,15 @@ public final class ThermalMonitor {
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
-    public init(fanControl: FanControl, profile: FanProfile = .silent) {
-        self.fanControl = fanControl
+    public init(profile: FanProfile = .silent,
+                readStatus: @escaping () throws -> ThermalStatus) {
         self.activeProfile = profile
         self.tickInterval = 0.1
+        self.readStatus = readStatus
+    }
+
+    public convenience init(fanControl: FanControl, profile: FanProfile = .silent) {
+        self.init(profile: profile) { try fanControl.status() }
     }
 
     // MARK: - Lifecycle
@@ -179,6 +200,20 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Arm a bounded handback watch. For the next `seconds`, hands-off ticks
+    /// re-send resetAuto while any fan still reads manual — covering a ramp
+    /// write already in flight when the profile switched, which can land at
+    /// the daemon AFTER the switch's resetAuto and re-pin the fans, even after
+    /// the hardware briefly confirmed auto first (the 2026-10-10 race took
+    /// both shapes). The window is bounded so a hands-off monitor never
+    /// permanently fights a dead daemon or an external tool legitimately
+    /// holding the fans in manual.
+    public func armHandbackWatch(seconds: Float = 10) {
+        queue.async { [self] in
+            handbackTicksLeft = Int(seconds / tickInterval)
+        }
+    }
+
     /// Force the NEXT tick to unconditionally re-take fan control. Used after the
     /// helper recovers: it exited through its `.restart` resetAuto path, so the
     /// fans are back in Apple auto and any app hold the helper recorded is gone.
@@ -204,8 +239,10 @@ public final class ThermalMonitor {
 
     // MARK: - Polling
 
-    private func tick() {
-        guard let status = try? fanControl.status() else { return }
+    /// Internal so tests drive ticks synchronously (with a scripted status
+    /// source); in production it only ever runs on `queue` via the timer.
+    func tick() {
+        guard let status = try? readStatus() else { return }
         latestStatus = status
 
         // Snapshot a pending forced re-take for this tick. The property itself is
@@ -349,29 +386,44 @@ public final class ThermalMonitor {
         let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
         let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
 
-        // Hands-off profiles (Silent): don't control fans, just monitor
+        // Hands-off profiles (Silent): don't control fans, just monitor. The
+        // handback to Apple auto is CONFIRMED against the hardware mode, not
+        // assumed from our own bookkeeping: a ramp write already in flight when
+        // the profile switched can land at the daemon AFTER the switch's
+        // resetAuto and re-pin the fans in manual (the 2026-10-10 race — the
+        // setRPM overtook the switch's resetAuto through the main-actor hop,
+        // the flag-clearing on switch then saw "not running" and never
+        // corrected the orphaned hold, which outlived the app until quit).
+        // Supervision is bounded: the switch arms a handback watch, and during
+        // the window a manual reading re-sends resetAuto (rate-limited) — also
+        // catching a re-pin that lands after the hardware briefly confirmed
+        // auto. forceNextWrite keeps its one-shot role (send once immediately)
+        // for the helper-recovery reconciliation. fansCurrentlyRunning only
+        // decides whether the settle bookkeeping runs, not whether to retry —
+        // bounded supervision never permanently fights a dead daemon or an
+        // external tool legitimately holding manual (AppState re-arms via
+        // forceReengage once the daemon recovers).
         if curve.handsOff {
-            if fansCurrentlyRunning {
-                applyCommand(.resetAuto)
-                fansCurrentlyRunning = false
-                speedController.reset()
-                lastWrittenRPMPercent = 0
-                state = .idle
-                // resetAuto is a real control action (fans handed to the system),
-                // so a pending forced re-take is satisfied here.
-                forceNextWrite = false
-            } else if forceNextWrite {
-                // Forced re-engage reconciliation for the hands-off case. A helper
-                // recovery can arm forceReengage (reengageAfterHelperRecovery does
-                // not gate on the profile) while the active profile is hands-off —
-                // Silent is the default and the restored choice — and the hardware
-                // may still be manual from before the crash. Hands-off never writes
-                // a hold of its own, so nothing would otherwise revert it: hand it
-                // back to Apple auto now (a real control action, satisfying the
-                // one-shot). Without the flag there is nothing to reconcile.
-                applyCommand(.resetAuto)
-                forceNextWrite = false
-                state = .idle
+            let watching = handbackTicksLeft > 0
+            if watching { handbackTicksLeft -= 1 }
+            if watching || forceNextWrite {
+                if status.fans.contains(where: { $0.mode == "manual" }) {
+                    if forceNextWrite || tickCounter % Self.handsOffRetryCadence == 0 {
+                        applyCommand(.resetAuto)
+                    }
+                    state = .idle
+                    // The forced re-take is consumed by the send attempt — its
+                    // one-shot contract ends there, not at a later settle.
+                    forceNextWrite = false
+                } else if fansCurrentlyRunning || forceNextWrite {
+                    fansCurrentlyRunning = false
+                    speedController.reset()
+                    lastWrittenRPMPercent = 0
+                    state = .idle
+                    TFLogger.shared.fan(
+                        "Fans handed back to Apple auto [\(activeProfile.name)]"
+                    )
+                }
             }
             return
         }
