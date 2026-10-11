@@ -20,6 +20,38 @@ import Combine
 import SwiftUI
 import ThermalForgeCore
 
+/// Draws the two-line readout (temp over RPM) directly, centered in the item's
+/// drawable area.
+///
+/// Why not attributedTitle: NSStatusBarButton's cell lays out wrapped titles
+/// with single-line metrics — the two-line block drew pushed up out of the
+/// item window, leaving the first line clipped at the menu bar's top edge
+/// (measured 2026-10-11: text rows 0..12 touching the bar's top edge, second
+/// line floating mid-high; setting button.font changed nothing, and swapping
+/// the cell broke width auto-sizing). A plain subview that ignores clicks and
+/// centers the measured text block itself is the only variant that rendered
+/// fully in-bounds.
+private final class TwoLineReadoutView: NSView {
+    var attributed = NSAttributedString() {
+        didSet {
+            if attributed != oldValue { needsDisplay = true }
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !attributed.string.isEmpty else { return }
+        let size = attributed.size()
+        attributed.draw(in: NSRect(
+            x: (bounds.width - size.width) / 2,
+            y: (bounds.height - size.height) / 2,
+            width: size.width,
+            height: size.height
+        ))
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 @MainActor
 final class StatusBarController: NSObject {
     private let appState: AppState
@@ -30,6 +62,9 @@ final class StatusBarController: NSObject {
     /// a plain subview so it rides the native button like it rode the SwiftUI
     /// overlay before.
     private let mismatchDot = NSView()
+
+    /// Owns the two-line readout (see TwoLineReadoutView).
+    private let readoutView = TwoLineReadoutView()
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -42,11 +77,10 @@ final class StatusBarController: NSObject {
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.imagePosition = .noImage
-            // The title is a two-line block (temp over RPM) — the status-bar
-            // cell defaults to single-line and would clamp it.
-            button.cell?.usesSingleLineMode = false
-            button.cell?.truncatesLastVisibleLine = false
-            button.cell?.wraps = true
+            button.attributedTitle = NSAttributedString(string: "")
+
+            readoutView.autoresizingMask = [.width, .height]
+            button.addSubview(readoutView)
 
             mismatchDot.wantsLayer = true
             mismatchDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
@@ -77,19 +111,20 @@ final class StatusBarController: NSObject {
 
     // MARK: - Button
 
+    /// Font metrics for the readout. 9.5pt SF mono digits, lines tightened a
+    /// touch so the block also fits the 24pt menu bars of non-notch displays
+    /// (natural spacing measures ~23pt for two lines — zero margin there).
+    private static let readoutFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
+    private static let lineHeightMultiple: CGFloat = 0.92
+
     private func refreshButton() {
         guard let button = statusItem.button else { return }
 
-        // No icon: the two-line readout IS the button. The monitor state's
-        // only remaining menu-bar cue is the orange temp line during a safety
-        // override (the icon that used to carry it is gone); the popover's
-        // stateIndicator keeps the full detail.
-        button.image = nil
-
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
+        paragraph.lineHeightMultiple = Self.lineHeightMultiple
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium),
+            .font: Self.readoutFont,
             .paragraphStyle: paragraph
         ]
 
@@ -109,15 +144,41 @@ final class StatusBarController: NSObject {
                 title.append(NSAttributedString(string: "\(rpm)", attributes: attributes))
             }
         }
-        button.attributedTitle = title
+        readoutView.attributed = title
 
-        // The dot sits just past the title block's top-right corner.
-        let titleWidth = button.attributedTitle.size().width
-        mismatchDot.isHidden = (appState.daemonVersionMismatch == nil)
+        // The readout draws itself; the item width is managed here. Monospaced
+        // digits keep a given line stable, but "9" → "10" or "°C" → "°F" still
+        // changes the widest line, so measure every refresh.
+        let blockWidth = ceil(title.size().width)
+        let dotVisible = appState.daemonVersionMismatch != nil
+        statusItem.length = blockWidth + 8 + (dotVisible ? 7 : 0)
+        if readoutView.frame != button.bounds {
+            readoutView.frame = button.bounds
+        }
+
+        // The dot sits just past the title block's top-right corner (the extra
+        // +7 length above reserves the space when it is showing).
+        mismatchDot.isHidden = !dotVisible
         mismatchDot.frame.origin = NSPoint(
-            x: min(titleWidth + 3, button.bounds.maxX - 5),
+            x: 4 + blockWidth + 5,
             y: button.bounds.maxY - 7
         )
+
+        // attributedTitle is empty (the cell's multi-line layout is broken —
+        // see TwoLineReadoutView), so VoiceOver reads the button via this label.
+        button.setAccessibilityLabel(accessibilityText(title.string))
+    }
+
+    private func accessibilityText(_ raw: String) -> String {
+        let parts = raw.split(separator: "\n").map(String.init)
+        switch parts.count {
+        case 2:
+            return "ThermalForge: \(parts[0]), fan \(parts[1]) RPM"
+        case 1:
+            return "ThermalForge: \(parts[0])"
+        default:
+            return "ThermalForge"
+        }
     }
 
     // MARK: - Popover
