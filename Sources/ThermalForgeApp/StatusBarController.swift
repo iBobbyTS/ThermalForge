@@ -20,38 +20,6 @@ import Combine
 import SwiftUI
 import ThermalForgeCore
 
-/// Draws the two-line readout (temp over RPM) directly, centered in the item's
-/// drawable area.
-///
-/// Why not attributedTitle: NSStatusBarButton's cell lays out wrapped titles
-/// with single-line metrics — the two-line block drew pushed up out of the
-/// item window, leaving the first line clipped at the menu bar's top edge
-/// (measured 2026-10-11: text rows 0..12 touching the bar's top edge, second
-/// line floating mid-high; setting button.font changed nothing, and swapping
-/// the cell broke width auto-sizing). A plain subview that ignores clicks and
-/// centers the measured text block itself is the only variant that rendered
-/// fully in-bounds.
-private final class TwoLineReadoutView: NSView {
-    var attributed = NSAttributedString() {
-        didSet {
-            if attributed != oldValue { needsDisplay = true }
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard !attributed.string.isEmpty else { return }
-        let size = attributed.size()
-        attributed.draw(in: NSRect(
-            x: (bounds.width - size.width) / 2,
-            y: (bounds.height - size.height) / 2,
-            width: size.width,
-            height: size.height
-        ))
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
 @MainActor
 final class StatusBarController: NSObject {
     private let appState: AppState
@@ -63,9 +31,6 @@ final class StatusBarController: NSObject {
     /// overlay before.
     private let mismatchDot = NSView()
 
-    /// Owns the two-line readout (see TwoLineReadoutView).
-    private let readoutView = TwoLineReadoutView()
-
     private var cancellables: Set<AnyCancellable> = []
 
     init(appState: AppState) {
@@ -76,11 +41,9 @@ final class StatusBarController: NSObject {
         if let button = statusItem.button {
             button.target = self
             button.action = #selector(togglePopover(_:))
-            button.imagePosition = .noImage
-            button.attributedTitle = NSAttributedString(string: "")
-
-            readoutView.autoresizingMask = [.width, .height]
-            button.addSubview(readoutView)
+            // The readout is delivered as a (usually template) image — see
+            // refreshButton for why the title path is not used.
+            button.imagePosition = .imageOnly
 
             mismatchDot.wantsLayer = true
             mismatchDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
@@ -129,11 +92,13 @@ final class StatusBarController: NSObject {
         ]
 
         let title = NSMutableAttributedString(string: "", attributes: attributes)
+        var safetyOverride = false
         if let tempC = appState.maxTemp {
             let fahrenheit = appState.useFahrenheit
             let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
             var tempAttrs = attributes
             if case .safetyOverride = appState.monitorState {
+                safetyOverride = true
                 tempAttrs[.foregroundColor] = NSColor.systemOrange
             }
             title.append(NSAttributedString(
@@ -144,28 +109,57 @@ final class StatusBarController: NSObject {
                 title.append(NSAttributedString(string: "\(rpm)", attributes: attributes))
             }
         }
-        readoutView.attributed = title
 
-        // The readout draws itself; the item width is managed here. Monospaced
-        // digits keep a given line stable, but "9" → "10" or "°C" → "°F" still
-        // changes the widest line, so measure every refresh.
-        let blockWidth = ceil(title.size().width)
-        let dotVisible = appState.daemonVersionMismatch != nil
-        statusItem.length = blockWidth + 8 + (dotVisible ? 7 : 0)
-        if readoutView.frame != button.bounds {
-            readoutView.frame = button.bounds
+        // The readout block is rendered into an image and set as the button's
+        // template image. Two reasons, both measured on 2026-10-11:
+        //
+        // 1. Layout: NSStatusBarButton's cell lays out multi-line TITLES with
+        //    single-line metrics — the two-line attributedTitle drew pushed up
+        //    out of the item window with the first line clipped at the bar's
+        //    top edge. A single image centers through the well-tested path.
+        // 2. Color: the menu bar tints its content by what is behind it — on
+        //    this machine a video wallpaper keeps the bar dark in Light mode
+        //    and the system glyphs go white there. Template images inherit
+        //    that tint exactly (it's the same mechanism the clock uses);
+        //    attributedTitle/self-drawn text only got fixed colors that went
+        //    unreadable on the opposite backdrop.
+        //
+        // The safety override temp line is the one case that needs real color:
+        // the image temporarily drops out of template mode for it (the RPM
+        // line then follows the effective appearance — close enough for a rare
+        // transient state).
+        if title.length > 0 {
+            let blockSize = title.size()
+            let image = NSImage(
+                size: NSSize(width: ceil(blockSize.width), height: ceil(blockSize.height)),
+                flipped: true
+            ) { rect in
+                title.draw(in: rect)
+                return true
+            }
+            image.isTemplate = !safetyOverride
+            button.image = image
+
+            let blockWidth = ceil(blockSize.width)
+            let dotVisible = appState.daemonVersionMismatch != nil
+            // Monospaced digits keep a given line stable, but "9" → "10" or
+            // "°C" → "°F" still changes the widest line — measure every refresh.
+            statusItem.length = blockWidth + 8 + (dotVisible ? 7 : 0)
+
+            // The dot sits just past the block's top-right corner (the +7
+            // length above reserves the space when it is showing).
+            mismatchDot.isHidden = !dotVisible
+            mismatchDot.frame.origin = NSPoint(
+                x: 4 + blockWidth + 5,
+                y: button.bounds.maxY - 7
+            )
+        } else {
+            button.image = nil
+            statusItem.length = NSStatusItem.variableLength
+            mismatchDot.isHidden = (appState.daemonVersionMismatch == nil)
         }
 
-        // The dot sits just past the title block's top-right corner (the extra
-        // +7 length above reserves the space when it is showing).
-        mismatchDot.isHidden = !dotVisible
-        mismatchDot.frame.origin = NSPoint(
-            x: 4 + blockWidth + 5,
-            y: button.bounds.maxY - 7
-        )
-
-        // attributedTitle is empty (the cell's multi-line layout is broken —
-        // see TwoLineReadoutView), so VoiceOver reads the button via this label.
+        // The image carries no text for VoiceOver — describe the readout.
         button.setAccessibilityLabel(accessibilityText(title.string))
     }
 
